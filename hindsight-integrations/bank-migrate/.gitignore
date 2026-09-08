@@ -1,0 +1,17 @@
+# Generated artifacts
+.local/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Never commit exported archives
+archives/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Virtualenv
+.venv/

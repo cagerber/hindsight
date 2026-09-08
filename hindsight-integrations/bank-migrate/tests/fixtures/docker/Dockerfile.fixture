@@ -1,0 +1,33 @@
+# Test fixture image: Hindsight standalone + deterministic seed data.
+#
+# Builds on top of the upstream standalone image. Adds:
+#   * seed_banks.yaml — declarative fixtures (empty in baseline)
+#   * loader.py      — applies fixtures to the live daemon at startup
+#   * entrypoint.py  — orchestrates daemon + seed + idle wait
+#
+# Build:   docker build -f Dockerfile.fixture -t hindsight-fixture:test .
+# Run:     docker run --rm -p 18888:8888 hindsight-fixture:test
+# Test:    HINDSIGHT_DAEMON_URL=http://127.0.0.1:18888 make test-conformance
+
+FROM ghcr.io/vectorize-io/hindsight:latest
+
+# Tools the seed loader needs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip \
+    && pip install --break-system-packages --no-cache-dir httpx pyyaml \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Seed data + scripts.
+COPY seed_banks.yaml /seed/seed_banks.yaml
+COPY seed/loader.py /seed/loader.py
+COPY scripts/entrypoint.py /entrypoint.py
+RUN chmod +x /entrypoint.py /seed/loader.py
+
+ENV HINDSIGHT_ENABLE_API=true \
+    HINDSIGHT_ENABLE_CP=false \
+    HINDSIGHT_API_URL=http://127.0.0.1:8888 \
+    HINDSIGHT_API_PORT=8888 \
+    SEED_CONFIG=/seed/seed_banks.yaml \
+    SEED_FORCE=false
+
+ENTRYPOINT ["python3", "/entrypoint.py"]

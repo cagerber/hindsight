@@ -1,0 +1,34 @@
+# Compose file for the conformance test fixture.
+#
+# Maps the daemon to host port 18888 (NOT 9177 — that's your live daemon).
+# Pass `SEED_FORCE=true` to reseed on every startup.
+
+services:
+  hindsight-fixture:
+    build:
+      context: .
+      dockerfile: Dockerfile.fixture
+    image: hindsight-fixture:test
+    container_name: hindsight-conformance-fixture
+    ports:
+      - "18888:8888"
+    environment:
+      - HINDSIGHT_API_LLM_PROVIDER=${HINDSIGHT_API_LLM_PROVIDER:-openai}
+      - HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_API_LLM_MODEL:-gpt-4o-mini}
+      - HINDSIGHT_API_LLM_API_KEY=${HINDSIGHT_API_LLM_API_KEY:-}
+      - HINDSIGHT_API_EMBEDDINGS_PROVIDER=${HINDSIGHT_API_EMBEDDINGS_PROVIDER:-openai}
+      - HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:-}
+      - HINDSIGHT_API_RERANKER_PROVIDER=${HINDSIGHT_API_RERANKER_PROVIDER:-}
+      - HINDSIGHT_API_COHERE_API_KEY=${HINDSIGHT_API_COHERE_API_KEY:-}
+      - SEED_FORCE=${SEED_FORCE:-false}
+    volumes:
+      - hindsight-fixture-data:/home/hindsight/.pg0
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  hindsight-fixture-data:

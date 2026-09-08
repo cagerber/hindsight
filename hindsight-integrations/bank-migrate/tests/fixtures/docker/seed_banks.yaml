@@ -1,0 +1,18 @@
+# Reproducible seed data for the Hindsight conformance test fixture.
+#
+# Baseline: this file ships empty (banks: []). Specific fixtures
+# (ODS cubes, cli_builder conventions, lobby registry entities) are
+# added in change-specific branches on top of this baseline.
+#
+# To populate: append a block under `banks:` and rebuild the fixture
+# (`make test-fixture-reseed`). The seed loader is idempotent — it
+# skips banks that already have facts.
+#
+# Loaded by `seed/loader.py` at container startup. Each entry becomes
+# a `retain` call against the live daemon so the daemon's extraction
+# pipeline produces the same canonical facts every time. All
+# document_ids are deterministic.
+#
+version: 1
+
+banks: []
