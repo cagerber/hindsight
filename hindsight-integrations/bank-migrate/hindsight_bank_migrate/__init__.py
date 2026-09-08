@@ -2,4 +2,4 @@
 
 Tracks upstream Hindsight versions. See CHANGELOG.md.
 """
-__version__ = "0.9.2-baseline"
+__version__ = "0.9.2.post1"

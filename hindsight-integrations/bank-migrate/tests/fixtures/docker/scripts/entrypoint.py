@@ -37,11 +37,15 @@ def start_daemon() -> subprocess.Popen:
 
 async def run_seed() -> None:
     """Run the seed loader."""
-    proc = await asyncio.create_subprocess_exec(
+    args = [
         sys.executable, "/seed/loader.py",
         "--daemon", DAEMON_URL,
         "--config", SEED_CONFIG,
-        "--force" if SEED_FORCE else "",
+    ]
+    if SEED_FORCE:
+        args.append("--force")
+    proc = await asyncio.create_subprocess_exec(
+        *args,
         stdout=sys.stdout,
         stderr=subprocess.STDOUT,
     )

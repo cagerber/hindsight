@@ -1,12 +1,7 @@
 # Reproducible seed data for the Hindsight conformance test fixture.
 #
-# Baseline: this file ships empty (banks: []). Specific fixtures
-# (ODS cubes, cli_builder conventions, lobby registry entities) are
-# added in change-specific branches on top of this baseline.
-#
-# To populate: append a block under `banks:` and rebuild the fixture
-# (`make test-fixture-reseed`). The seed loader is idempotent — it
-# skips banks that already have facts.
+# Change-specific branch: ships ODS / cli_builder / lobby fixtures.
+# Branches from feature/test-pack-baseline; that file ships empty.
 #
 # Loaded by `seed/loader.py` at container startup. Each entry becomes
 # a `retain` call against the live daemon so the daemon's extraction
@@ -15,4 +10,82 @@
 #
 version: 1
 
-banks: []
+banks:
+  - bank_id: "coding-agent::repo::ods-fixture"
+    description: |
+      Knowledge fixture for the ODS repo bank. Seeded so the conformance
+      suite can assert recall surfaces these facts.
+    documents:
+      - document_id: "fixture:ods:bi-cubes"
+        content: |
+          ODS uses BI.* namespaces for warehouse cubes (BI.TheatreUtilisation,
+          BI.FactPatientDaily) and ODS.* for application classes. Refresh runs
+          at 04:00 UTC daily.
+        tags: ["fixture", "source:seed", "bank:ods"]
+        metadata:
+          doc_type: knowledge
+          entity: ods
+      - document_id: "fixture:ods:deploy"
+        content: |
+          ODS is deployed via the site-deploy tool (uv run site-deploy <site-id>).
+          The deployment carries IPM modules and the ODS manifest. CSP drift is
+          fixed by force-reloading the same version, not by uninstalling.
+        tags: ["fixture", "source:seed", "bank:ods"]
+        metadata:
+          doc_type: knowledge
+          entity: ods
+      - document_id: "fixture:ods:theatre-utilisation"
+        content: |
+          Theatre utilisation is measured as the ratio of booked hours to
+          available hours, per theatre per day. TheFactTheatreBooking cube
+          has a util_pct column and a util_pct_py column for prior-year
+          comparison. Variance analysis excludes scheduled maintenance windows.
+        tags: ["fixture", "source:seed", "bank:ods"]
+        metadata:
+          doc_type: knowledge
+          entity: ods
+
+  - bank_id: "coding-agent::repo::cli_builder-fixture"
+    description: |
+      Knowledge fixture for the cli_builder repo bank.
+    documents:
+      - document_id: "fixture:cli_builder:config-first"
+        content: |
+          The cli_builder tool enforces config-first design: every CLI option,
+          every error path, and every success path must be declared in a YAML
+          config file. Hand-edited docs are forbidden — they're generated and
+          freshness-gated.
+        tags: ["fixture", "source:seed", "bank:cli_builder"]
+        metadata:
+          doc_type: knowledge
+          entity: cli_builder
+
+  - bank_id: "coding-agent::project::lobby-fixture"
+    description: |
+      Lobby fixture: a single registered entity, with one parent and one
+      related peer. Used to test registry round-trip and lobby resolution
+      without touching the production lobby bank.
+    documents:
+      - document_id: "fixture:lobby:entity-fixture-entity"
+        content: |
+          The fixture-entity is a synthetic entity used by the conformance
+          suite to verify lobby round-trip. It has one parent and one related
+          peer.
+        tags: ["fixture", "source:seed", "bank:lobby"]
+        metadata:
+          doc_type: knowledge
+          entity: fixture-entity
+      - document_id: "bank-meta:registry:fixture-entity"
+        content: |
+          [registered entity — content is structured as a single document per
+          entity to survive the retain pipeline's LLM extraction. The actual
+          RegistryEntry fields are encoded here as plain text.]
+        tags: ["fixture", "source:seed", "bank:lobby", "lobby:registry"]
+        metadata:
+          doc_type: registry
+          entity: fixture-entity
+          parent: trifour
+          related: [ods, cli_builder]
+          scope_tags: [biz:test]
+          banks:
+            project: "coding-agent::project::lobby-fixture"

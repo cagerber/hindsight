@@ -3,18 +3,22 @@
 
 # Default: unit tests only (fast, hermetic).
 test:
+	uv sync --extra dev
 	uv run pytest -q
 
 test-unit:
+	uv sync --extra dev
 	uv run pytest -q
 
 # Conformance tests — requires a live Hindsight daemon at HINDSIGHT_DAEMON_URL
 # (defaults to http://127.0.0.1:9177). Use before every upstream upgrade.
 test-conformance:
+	uv sync --extra dev
 	uv run pytest -m conformance -v
 
 # Conformance tests against the docker fixture (hermetic, reproducible).
 test-conformance-fixture:
+	uv sync --extra dev
 	HINDSIGHT_DAEMON_URL=http://127.0.0.1:18888 uv run pytest -m conformance -v
 
 # Start the docker test fixture (host port 18888).
@@ -33,4 +37,4 @@ test-fixture-reseed:
 	SEED_FORCE=true docker compose -f tests/fixtures/docker/docker-compose.test.yml up --build -d
 
 install:
-	uv sync
+	uv sync --extra dev

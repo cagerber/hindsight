@@ -5,22 +5,28 @@
 #   * loader.py      — applies fixtures to the live daemon at startup
 #   * entrypoint.py  — orchestrates daemon + seed + idle wait
 #
+# The upstream image already provides Python 3.11 + httpx. We only
+# need pyyaml (and we install it as the `hindsight` user, not root,
+# to avoid the apt-get permission issue we hit).
+#
 # Build:   docker build -f Dockerfile.fixture -t hindsight-fixture:test .
 # Run:     docker run --rm -p 18888:8888 hindsight-fixture:test
 # Test:    HINDSIGHT_DAEMON_URL=http://127.0.0.1:18888 make test-conformance
 
 FROM ghcr.io/vectorize-io/hindsight:latest
 
-# Tools the seed loader needs.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3-pip \
-    && pip install --break-system-packages --no-cache-dir httpx pyyaml \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install pyyaml as the `hindsight` user (uid 1000) without touching apt.
+# The upstream image runs as `hindsight`, so installing as root would create
+# files the user can't write to.
+USER hindsight
+ENV PATH=/home/hindsight/.local/bin:$PATH
+RUN pip install --user --no-cache-dir pyyaml 2>&1 | tail -3 || \
+    pip3 install --user --no-cache-dir pyyaml 2>&1 | tail -3
 
-# Seed data + scripts.
-COPY seed_banks.yaml /seed/seed_banks.yaml
-COPY seed/loader.py /seed/loader.py
-COPY scripts/entrypoint.py /entrypoint.py
+# Seed data + scripts (read-only).
+COPY --chown=hindsight:hindsight seed_banks.yaml /seed/seed_banks.yaml
+COPY --chown=hindsight:hindsight seed/loader.py /seed/loader.py
+COPY --chown=hindsight:hindsight scripts/entrypoint.py /entrypoint.py
 RUN chmod +x /entrypoint.py /seed/loader.py
 
 ENV HINDSIGHT_ENABLE_API=true \
@@ -28,6 +34,7 @@ ENV HINDSIGHT_ENABLE_API=true \
     HINDSIGHT_API_URL=http://127.0.0.1:8888 \
     HINDSIGHT_API_PORT=8888 \
     SEED_CONFIG=/seed/seed_banks.yaml \
-    SEED_FORCE=false
+    SEED_FORCE=false \
+    PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["python3", "/entrypoint.py"]
