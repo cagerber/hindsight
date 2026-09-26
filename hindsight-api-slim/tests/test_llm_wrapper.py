@@ -326,3 +326,111 @@ def test_llm_provider_constructor_ignores_global_safety_settings(monkeypatch):
     assert provider.gemini_safety_settings is None  # not inherited from global config
 
     clear_config_cache()
+
+
+def test_llm_provider_batch_base_url_is_appended_positionally():
+    """The new parameter is appended, so the old positional call shape is unchanged."""
+    from hindsight_api.engine.llm_wrapper import LLMProvider
+
+    provider = LLMProvider(
+        "ollama",
+        "",
+        "",
+        "llama3.2",
+        "low",
+        None,
+        None,
+        None,
+        None,
+        False,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        7.5,
+    )
+
+    assert provider.timeout == 7.5
+    assert provider.batch_base_url is None
+
+
+def test_llm_provider_threads_batch_base_url_to_provider_impl():
+    """The separate Batch API host reaches OpenAICompatibleLLM, normalized."""
+    from hindsight_api.engine.llm_wrapper import LLMProvider
+
+    provider = LLMProvider(
+        provider="openai",
+        api_key="sk-test",
+        base_url="https://chat.example/v1",
+        model="gpt-4o-mini",
+        batch_base_url="https://batch.example/v1/",
+    )
+
+    assert provider.batch_base_url == "https://batch.example/v1/"
+    assert provider._provider_impl._batch_base_url == "https://batch.example/v1"
+
+
+def test_openai_compatible_batch_client_uses_configured_host():
+    """Batch calls go to the batch host; chat stays on base_url."""
+    from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
+
+    llm = OpenAICompatibleLLM(
+        provider="openai",
+        api_key="sk-test",
+        base_url="https://chat.example/v1",
+        model="gpt-4o-mini",
+        batch_base_url="https://batch.example/v1/",
+    )
+
+    batch_client = llm._batch_client()
+    assert batch_client is not llm._client
+    assert llm._batch_client() is batch_client  # created lazily, once
+    assert str(batch_client.base_url).rstrip("/") == "https://batch.example/v1"
+    assert str(llm._client.base_url).rstrip("/") == "https://chat.example/v1"
+
+
+def test_openai_compatible_batch_client_defaults_to_chat_client():
+    """No batch_base_url keeps the historical single-client behaviour."""
+    from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
+
+    llm = OpenAICompatibleLLM(
+        provider="openai",
+        api_key="sk-test",
+        base_url="https://chat.example/v1",
+        model="gpt-4o-mini",
+    )
+
+    assert llm._batch_client() is llm._client
+
+
+def test_config_reads_batch_base_url_env(monkeypatch):
+    """Both the global and retain-role batch hosts round-trip from the environment."""
+    from hindsight_api.config import (
+        ENV_LLM_BATCH_BASE_URL,
+        ENV_RETAIN_LLM_BATCH_BASE_URL,
+        HindsightConfig,
+        clear_config_cache,
+    )
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("HINDSIGHT_API_SKIP_LLM_VERIFICATION", "true")
+    monkeypatch.setenv(ENV_LLM_BATCH_BASE_URL, "https://batch.example/v1")
+    monkeypatch.setenv(ENV_RETAIN_LLM_BATCH_BASE_URL, "https://retain-batch.example/v1")
+    clear_config_cache()
+
+    try:
+        config = HindsightConfig.from_env()
+        assert config.llm_batch_base_url == "https://batch.example/v1"
+        assert config.retain_llm_batch_base_url == "https://retain-batch.example/v1"
+    finally:
+        monkeypatch.delenv(ENV_LLM_BATCH_BASE_URL, raising=False)
+        monkeypatch.delenv(ENV_RETAIN_LLM_BATCH_BASE_URL, raising=False)
+        clear_config_cache()
+
+    assert HindsightConfig.from_env().llm_batch_base_url is None
+    assert HindsightConfig.from_env().retain_llm_batch_base_url is None
+    clear_config_cache()
