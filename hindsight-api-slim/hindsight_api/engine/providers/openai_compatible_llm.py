@@ -940,14 +940,10 @@ class OpenAICompatibleLLM(LLMInterface):
         # from the old 300 s literal to 120 s. That is the point — one knob,
         # honoured everywhere — and such a deployment must raise ENV_LLM_TIMEOUT.
         self._ollama_http = LoopLocalSession(timeout=build_aiohttp_timeout(self.timeout))
-        # Kept so the Batch API client (host may differ from the chat host) can be
-        # built from the identical kwargs — same key, headers and timeout — with
-        # only base_url swapped. See _batch_client().
         self._client_kwargs = client_kwargs
         # Batch API host, when the vendor splits it from the chat host (Xiaomi MiMo).
         # Empty means None so truthiness alone distinguishes "not configured".
         self._batch_base_url = (batch_base_url or "").rstrip("/") or None
-        self._batch_client_instance: AsyncOpenAI | None = None
         logger.info(
             f"OpenAI-compatible client initialized: provider={self.provider}, model={self.model}, "
             f"base_url={self.base_url or 'default'}, "
@@ -967,27 +963,57 @@ class OpenAICompatibleLLM(LLMInterface):
             f"mode={self._cache_affinity.value}"
         )
 
-    def _batch_client(self) -> AsyncOpenAI:
-        """Client for Batch API calls (``/v1/files``, ``/v1/batches``).
+    def _batch_api_base(self) -> str:
+        """Base URL for the documented Batch API endpoints (``/files``, ``/batches``).
 
-        Most OpenAI-compatible vendors serve chat and the Batch API on one host, so
-        with no ``batch_base_url`` configured this is exactly the chat client and
-        nothing changes. Vendors that split them (Xiaomi MiMo serves chat and batch on
-        different hosts) get a second client built lazily from the same assembled
-        kwargs with only ``base_url`` replaced, so the API key, headers and timeout
-        still apply verbatim.
+        A vendor that splits chat and batch across hosts gets its own host here; with
+        no ``batch_base_url`` the chat host serves both and nothing changes.
         """
-        if not self._batch_base_url:
-            return self._client
-        if self._batch_client_instance is None:
-            batch_kwargs = dict(self._client_kwargs)
-            batch_kwargs["base_url"] = self._batch_base_url
-            # default_query was derived from the *chat* URL's query string (Azure's
-            # api-version), so carrying it onto a different host would send another
-            # vendor's parameters to the batch endpoint.
-            batch_kwargs.pop("default_query", None)
-            self._batch_client_instance = AsyncOpenAI(**batch_kwargs)
-        return self._batch_client_instance
+        base = (self._batch_base_url or self.base_url or "").rstrip("/")
+        if not base:
+            raise RuntimeError(
+                "Batch API needs a base URL: set HINDSIGHT_API_LLM_BATCH_BASE_URL "
+                "(or a provider base_url)"
+            )
+        return base
+
+    def _batch_api_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self.api_key and self.api_key != "local":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    async def _batch_api_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        form: "aiohttp.FormData | None" = None,
+        raw: bool = False,
+    ) -> Any:
+        """Call a Batch API endpoint directly, over HTTP.
+
+        Deliberately not the OpenAI SDK. The documented endpoints are plain HTTP; the
+        SDK adds a second client and its own field validation for no benefit here, and
+        a vendor extension field (MiMo's required ``name``) is precisely the kind of
+        thing it will not carry. Errors surface the provider's own body, which is the
+        only thing that makes its 500s diagnosable.
+        """
+        url = f"{self._batch_api_base()}{path}"
+        session = self._ollama_http.get()
+        async with asyncio.timeout(self.timeout):
+            async with session.request(
+                method, url, json=json_body, data=form, headers=self._batch_api_headers()
+            ) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(
+                        f"Batch API {method} {path} -> HTTP {response.status}: {body[:500]}"
+                    )
+                if raw:
+                    return body
+                return json.loads(body) if body else {}
 
     def _drops_tool_choice_required(self) -> bool:
         """Whether this endpoint silently ignores ``tool_choice="required"``.
@@ -2171,34 +2197,46 @@ class OpenAICompatibleLLM(LLMInterface):
 
         logger.info(f"Submitting batch with {len(requests)} requests to {self.provider}")
 
-        # Format requests as JSONL
+        # Format requests as JSONL: one documented {custom_id, method, url, body} per line.
         jsonl_content = "\n".join(json.dumps(req, ensure_ascii=False) for req in requests)
 
-        # Upload file to provider (wrap in BytesIO with filename)
-        file_bytes = io.BytesIO(jsonl_content.encode("utf-8"))
-        file_bytes.name = "batch_input.jsonl"  # OpenAI SDK needs a filename
-
-        file_response = await self._batch_client().files.create(
-            file=file_bytes,
-            purpose="batch",
+        # Step 1 — upload the job file to the file service (multipart: purpose + file).
+        form = aiohttp.FormData()
+        form.add_field("purpose", "batch")
+        form.add_field(
+            "file",
+            jsonl_content.encode("utf-8"),
+            filename="batch_input.jsonl",
+            content_type="application/jsonl",
         )
+        file_response = await self._batch_api_request("POST", "/files", form=form)
+        input_file_id = file_response["id"]
+        logger.debug(f"Uploaded batch file: {input_file_id}")
 
-        logger.debug(f"Uploaded batch file: {file_response.id}")
+        # Step 2 — create the job. MiMo requires ``name`` (its console's "job
+        # description") and answers a bare 500 — not a 400 naming the field — when it
+        # is missing. It is sent whenever batch has a host of its own, which is the
+        # signal that this is a vendor with its own create schema; vanilla OpenAI
+        # takes the three standard fields only.
+        payload: dict[str, Any] = {
+            "input_file_id": input_file_id,
+            "endpoint": endpoint,
+            "completion_window": completion_window,
+        }
+        if self._batch_base_url:
+            payload["name"] = f"hindsight-{self.provider}-batch"
 
-        # Create batch
-        batch_response = await self._batch_client().batches.create(
-            input_file_id=file_response.id,
-            endpoint=endpoint,
-            completion_window=completion_window,
+        batch_response = await self._batch_api_request("POST", "/batches", json_body=payload)
+
+        logger.info(
+            f"Batch submitted: {batch_response.get('id')}, status={batch_response.get('status')}"
         )
-
-        logger.info(f"Batch submitted: {batch_response.id}, status={batch_response.status}")
 
         return {
-            "batch_id": batch_response.id,
-            "status": batch_response.status,
-            "input_file_id": file_response.id,
-            "created_at": batch_response.created_at,
+            "batch_id": batch_response["id"],
+            "status": batch_response.get("status"),
+            "input_file_id": input_file_id,
+            "created_at": batch_response.get("created_at"),
             "request_count": len(requests),
         }
 
@@ -2215,27 +2253,28 @@ class OpenAICompatibleLLM(LLMInterface):
         if not await self.supports_batch_api():
             raise NotImplementedError(f"Batch API not supported for provider: {self.provider}")
 
-        batch = await self._batch_client().batches.retrieve(batch_id)
+        batch = await self._batch_api_request("GET", f"/batches/{batch_id}")
 
+        counts = batch.get("request_counts") or {}
         result = {
-            "batch_id": batch.id,
-            "status": batch.status,
-            "created_at": batch.created_at,
+            "batch_id": batch.get("id", batch_id),
+            "status": batch.get("status"),
+            "created_at": batch.get("created_at"),
             "request_counts": {
-                "total": batch.request_counts.total if batch.request_counts else 0,
-                "completed": batch.request_counts.completed if batch.request_counts else 0,
-                "failed": batch.request_counts.failed if batch.request_counts else 0,
+                "total": counts.get("total", 0),
+                "completed": counts.get("completed", 0),
+                "failed": counts.get("failed", 0),
             },
         }
 
-        if batch.completed_at:
-            result["completed_at"] = batch.completed_at
-        if batch.output_file_id:
-            result["output_file_id"] = batch.output_file_id
-        if batch.error_file_id:
-            result["error_file_id"] = batch.error_file_id
-        if batch.errors:
-            result["errors"] = batch.errors
+        if batch.get("completed_at"):
+            result["completed_at"] = batch["completed_at"]
+        if batch.get("output_file_id"):
+            result["output_file_id"] = batch["output_file_id"]
+        if batch.get("error_file_id"):
+            result["error_file_id"] = batch["error_file_id"]
+        if batch.get("errors"):
+            result["errors"] = batch["errors"]
 
         return result
 
@@ -2253,21 +2292,27 @@ class OpenAICompatibleLLM(LLMInterface):
             raise NotImplementedError(f"Batch API not supported for provider: {self.provider}")
 
         # Get batch status
-        batch = await self._batch_client().batches.retrieve(batch_id)
+        batch = await self._batch_api_request("GET", f"/batches/{batch_id}")
 
-        if batch.status != "completed":
-            raise ValueError(f"Batch {batch_id} is not completed yet (status: {batch.status})")
+        if batch.get("status") != "completed":
+            raise ValueError(
+                f"Batch {batch_id} is not completed yet (status: {batch.get('status')})"
+            )
 
-        if not batch.output_file_id:
+        output_file_id = batch.get("output_file_id")
+        if not output_file_id:
             raise ValueError(f"Batch {batch_id} has no output file")
 
-        # Download results file
-        logger.debug(f"Downloading results for batch {batch_id} from file {batch.output_file_id}")
-        file_content = await self._batch_client().files.content(batch.output_file_id)
+        # Download the results file. This endpoint serves JSONL, not JSON, so it is
+        # fetched raw and parsed line by line.
+        logger.debug(f"Downloading results for batch {batch_id} from file {output_file_id}")
+        file_text = await self._batch_api_request(
+            "GET", f"/files/{output_file_id}/content", raw=True
+        )
 
         # Parse JSONL results
         results = []
-        for line in file_content.text.strip().split("\n"):
+        for line in file_text.strip().split("\n"):
             if line:
                 results.append(json.loads(line))
 
@@ -2281,9 +2326,6 @@ class OpenAICompatibleLLM(LLMInterface):
             await self._client.close()
         if hasattr(self, "_ollama_http"):
             await self._ollama_http.close()
-        # Only exists when batch_base_url was configured and a batch call was made.
-        if getattr(self, "_batch_client_instance", None):
-            await self._batch_client_instance.close()
 
     def supports_attempt_scoped_concurrency(self) -> bool:
         return True
