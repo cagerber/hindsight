@@ -471,6 +471,7 @@ def create_llm_provider(
     # tests/test_llm_wrapper.py), so a parameter added mid-list silently steals
     # another one's slot. New parameters go at the end.
     codex_home: str | None = None,
+    batch_base_url: str | None = None,
 ) -> Any:  # Returns LLMInterface
     """
     Factory function to create the appropriate LLM provider implementation.
@@ -521,6 +522,10 @@ def create_llm_provider(
             Anthropic and Gemini keep their provider-specific defaults).
         codex_home: Codex credentials directory (for the openai-codex provider); overrides
             the process-wide ``CODEX_HOME``.
+        batch_base_url: Base URL for Batch API calls (``/v1/files``, ``/v1/batches``),
+            forwarded to the ``OpenAICompatibleLLM`` branch for vendors that serve chat
+            and the Batch API on different hosts (Xiaomi MiMo). ``None`` keeps the
+            Batch API on ``base_url``. Providers on other branches ignore it.
 
     Returns:
         LLMInterface implementation for the specified provider.
@@ -808,6 +813,7 @@ def create_llm_provider(
             cache_affinity=cache_affinity,
             ollama_num_ctx=ollama_num_ctx,
             timeout=timeout,
+            batch_base_url=batch_base_url,
         )
 
     else:
@@ -851,6 +857,7 @@ class LLMProvider:
         # callers that pass these positionally would otherwise have one argument
         # land in the wrong slot.
         codex_home: str | None = None,
+        batch_base_url: str | None = None,
     ):
         """
         Initialize LLM provider.
@@ -906,6 +913,11 @@ class LLMProvider:
                 uses the process-wide ``CODEX_HOME`` (else ``~/.codex``). Set it per member of a
                 multi-LLM chain to run two independently authorized ChatGPT profiles, so that
                 failover away from a rate-limited profile actually reaches a different account.
+            batch_base_url: Base URL for Batch API calls (``/v1/files``, ``/v1/batches``)
+                for the OpenAI-compatible providers, or ``None`` to use ``base_url``.
+                Only needed when a vendor serves chat and the Batch API on different hosts
+                (Xiaomi MiMo); other providers ignore it. Used verbatim — the caller
+                resolves the per-operation/global fallback.
 
         This constructor uses every argument as passed and does not read global
         ``HindsightConfig``: resolving the server-level default for a ``None`` argument is the
@@ -932,6 +944,9 @@ class LLMProvider:
         # Codex credentials directory (openai-codex only). Used verbatim — the caller
         # resolves the server-level default, like the fields around it.
         self.codex_home = codex_home
+        # Batch API host for the OpenAI-compatible provider (None = same as base_url).
+        # Used verbatim — the caller resolves the per-operation/global fallback.
+        self.batch_base_url = batch_base_url
         # Service tiers from hierarchical config (not env vars)
         self.groq_service_tier = groq_service_tier
         self.openai_service_tier = openai_service_tier
@@ -1102,6 +1117,7 @@ class LLMProvider:
             timeout=self.timeout,
             cache_affinity=self.cache_affinity,
             structured_output_forced_tool=self.structured_output_forced_tool,
+            batch_base_url=self.batch_base_url,
         )
 
         # Backward compatibility: Keep mock provider properties
@@ -1710,6 +1726,7 @@ class LLMProvider:
             extra_body=config.llm_extra_body,
             default_headers=config.llm_default_headers,
             cache_affinity=config.llm_cache_affinity,
+            batch_base_url=config.llm_batch_base_url,
             groq_service_tier=config.llm_groq_service_tier,
             openai_service_tier=config.llm_openai_service_tier,
             bedrock_service_tier=config.llm_bedrock_service_tier,
