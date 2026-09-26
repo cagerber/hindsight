@@ -539,6 +539,12 @@ ENV_CONSOLIDATION_LLM_API_KEY = "HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY"
 ENV_CONSOLIDATION_LLM_MODEL = "HINDSIGHT_API_CONSOLIDATION_LLM_MODEL"
 ENV_CONSOLIDATION_LLM_BASE_URL = "HINDSIGHT_API_CONSOLIDATION_LLM_BASE_URL"
 ENV_CONSOLIDATION_LLM_MAX_CONCURRENT = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT"
+# Consolidation-role batch switch, mirroring ENV_RETAIN_BATCH_ENABLED. Consolidation's
+# per-llm_batch call is a single structured completion with no tool use, so it is a
+# batch-shaped workload too. The batch host needs no extra wiring: the per-role base
+# URL is derived generically (see ENV_LLM_BATCH_BASE_URL), so the global one covers it.
+ENV_CONSOLIDATION_BATCH_ENABLED = "HINDSIGHT_API_CONSOLIDATION_BATCH_ENABLED"
+ENV_CONSOLIDATION_BATCH_POLL_INTERVAL_SECONDS = "HINDSIGHT_API_CONSOLIDATION_BATCH_POLL_INTERVAL_SECONDS"
 ENV_CONSOLIDATION_LLM_MAX_RETRIES = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_RETRIES"
 ENV_CONSOLIDATION_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_INITIAL_BACKOFF"
 ENV_CONSOLIDATION_LLM_MAX_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_BACKOFF"
@@ -2198,6 +2204,11 @@ DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = (
     100  # Max memories per consolidation round (0 = unlimited). Limits how long one bank holds a worker slot.
 )
 DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 8  # Facts per LLM call (1 = no batching; >1 = batch mode)
+# Route each llm_batch through the provider's Batch API instead of a live call. Off by
+# default: it trades latency for cost, so it is opt-in like retain's flag. Kept in step
+# with the retain poll interval so an operator reading one setting understands both.
+DEFAULT_CONSOLIDATION_BATCH_ENABLED = False
+DEFAULT_CONSOLIDATION_BATCH_POLL_INTERVAL_SECONDS = DEFAULT_RETAIN_BATCH_POLL_INTERVAL_SECONDS
 # Cosine >= this between a newly-created or freshly-updated observation and an existing one
 # triggers a focused 1-by-1 LLM "merge or keep" pass (the LLM reads both, so numbers/negation/
 # entities are respected). Enabled by default; set to 1.0 to disable. Postgres only — the merge
@@ -4091,6 +4102,8 @@ class HindsightConfig:
     mental_model_min_refresh_interval_seconds: int
     page_default_trigger: dict | None
     consolidation_batch_size: int
+    consolidation_batch_enabled: bool
+    consolidation_batch_poll_interval_seconds: int
     consolidation_dedup_threshold: float
     consolidation_max_memories_per_round: int
     consolidation_llm_batch_size: int
@@ -6055,6 +6068,16 @@ class HindsightConfig:
             or DEFAULT_PAGE_DEFAULT_TRIGGER,
             consolidation_batch_size=int(
                 os.getenv(ENV_CONSOLIDATION_BATCH_SIZE, str(DEFAULT_CONSOLIDATION_BATCH_SIZE))
+            ),
+            consolidation_batch_enabled=os.getenv(
+                ENV_CONSOLIDATION_BATCH_ENABLED, str(DEFAULT_CONSOLIDATION_BATCH_ENABLED)
+            ).lower()
+            == "true",
+            consolidation_batch_poll_interval_seconds=int(
+                os.getenv(
+                    ENV_CONSOLIDATION_BATCH_POLL_INTERVAL_SECONDS,
+                    str(DEFAULT_CONSOLIDATION_BATCH_POLL_INTERVAL_SECONDS),
+                )
             ),
             consolidation_max_memories_per_round=int(
                 os.getenv(
