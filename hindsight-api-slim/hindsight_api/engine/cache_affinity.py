@@ -55,7 +55,13 @@ _OPENCODE_DOMAINS = ("opencode.ai",)
 # `unrecognized_request_argument` (#3518). The host says nothing about which
 # model family the deployment serves, so `auto` stays off there and an Azure
 # GPT operator opts in with openai_prompt_cache_key.
-_OPENAI_DOMAINS = ("openai.com",)
+# xiaomimimo.com is listed despite not being OpenAI: its OpenAI-compatible endpoint
+# accepts prompt_cache_key (HTTP 200, no `unrecognized_request_argument`) and
+# demonstrably honours prefix caching — a retain call on
+# https://api.xiaomimimo.com/v1/chat/completions reported
+# usage.prompt_tokens_details.cached_tokens of 4416 on 7796 input tokens. So `auto`
+# may emit OpenAI's cache-routing field for MiMo hosts, exactly as it does for OpenAI.
+_OPENAI_DOMAINS = ("openai.com", "xiaomimimo.com")
 
 
 class CacheAffinityMode(StrEnum):

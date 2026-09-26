@@ -199,6 +199,9 @@ def test_invalid_mode_raises():
         ("openai", None, CacheAffinityMode.OPENAI_PROMPT_CACHE_KEY),
         ("openai", "", CacheAffinityMode.OPENAI_PROMPT_CACHE_KEY),
         ("openai", "https://api.openai.com/v1", CacheAffinityMode.OPENAI_PROMPT_CACHE_KEY),
+        # Xiaomi MiMo accepts the field and honours prefix caching (see the allowlist comment).
+        ("openai", "https://api.xiaomimimo.com/v1", CacheAffinityMode.OPENAI_PROMPT_CACHE_KEY),
+        ("openai", "https://api.xiaomimimo.com.evil.example/v1", CacheAffinityMode.NONE),
         ("openai", "https://my-res.openai.azure.com/openai/deployments/x", CacheAffinityMode.NONE),
         ("fireworks", "https://api.fireworks.ai/inference/v1", CacheAffinityMode.NONE),
         ("fireworks", "", CacheAffinityMode.NONE),
