@@ -3857,6 +3857,33 @@ class UpdateMentalModelRequest(BaseModel):
     max_tokens: int | None = Field(default=None, ge=256, le=8192, description="Maximum tokens for generated content")
     tags: list[str] | None = Field(default=None, description="Tags for scoped visibility")
     trigger: MentalModelTrigger | None = Field(default=None, description="Trigger settings")
+    # A page's body is LLM output, and the only route that could previously write one
+    # was the refresh task — which forces that LLM work to happen inside the daemon,
+    # holding a worker slot for the minutes a refresh takes. `content` lets a caller
+    # that produced the body elsewhere (one batch job across every page, half price,
+    # no slot held) hand it over through the same engine call the refresh path already
+    # uses, so re-embedding, the search vector and the history snapshot all happen
+    # exactly as they do for a refresh.
+    content: str | None = Field(
+        default=None,
+        description=(
+            "New body for the page. The engine re-embeds the model from name + content "
+            "and snapshots the previous body into its history, as a refresh does."
+        ),
+    )
+    # Deliberately not defaulted to now(). The watermark means "the newest in-scope
+    # memory visible when this body was built", and setting it too high marks memories
+    # the body never saw as seen — they would never make the page stale, so they would
+    # never reach it. Omitting it leaves the watermark untouched and the page stale,
+    # which re-refreshes rather than hides: the safe direction to fail in.
+    refresh_watermark: datetime | None = Field(
+        default=None,
+        description=(
+            "The newest in-scope memory `updated_at` visible when `content` was built — "
+            "not `now()`. Written to `last_memory_seen_at`, which staleness compares "
+            "against. Omitting it leaves the watermark alone and the page stale."
+        ),
+    )
 
 
 class OperationProgress(BaseModel):
@@ -6742,6 +6769,12 @@ def _register_routes(app: FastAPI):
                 # page meant losing delta mode and its observation-only scope.
                 # Same fix as #3506, which corrected only the page routes.
                 trigger=body.trigger.model_dump(exclude_unset=True) if body.trigger else None,
+                content=body.content,
+                refresh_watermark=body.refresh_watermark,
+                # A request carrying a body is a refresh that ran to completion —
+                # elsewhere. Stamping last_refreshed_at is what stops the edit reading
+                # as "never refreshed", which the next sweep would silently redo.
+                refresh_completed=body.content is not None,
                 request_context=request_context,
             )
             if mental_model is None:
