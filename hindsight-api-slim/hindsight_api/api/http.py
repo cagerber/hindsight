@@ -10270,9 +10270,31 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         type: str | None = Query(None, description="Optional fact type filter (world, experience, observation)"),
         request_context: RequestContext = Depends(get_request_context),
+        http_request: Request = None,  # for the body-presence guard; see comment below
     ):
         """Clear memories for a memory bank, optionally filtered by type."""
         try:
+            # Guard: the API contract documents only the `?type=` query parameter.
+            # A request body is not part of the contract. Silently ignoring an
+            # undocumented JSON body in a *destructive* endpoint is what made
+            # the 2026-09-29 incident possible — a caller passing a filter-shaped
+            # JSON body (e.g. {"metadata": {...}}) had no effect on scoping, and
+            # the endpoint still cleared every memory unit. Reject any non-empty
+            # body with a 422 so the caller knows the body was the wrong shape.
+            body = await http_request.body()
+            if body:
+                # Strip whitespace-only payloads (curl/tests sometimes emit "").
+                if body.strip():
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "DELETE /v1/default/banks/{bank_id}/memories accepts no request body. "
+                            "Use the documented `?type=` query parameter to scope the clear "
+                            "(world, experience, or observation). Passing a JSON body is "
+                            "unsupported and a destructive endpoint with no body filter is "
+                            "an unsafe combination; we refuse it loudly rather than ignore it."
+                        ),
+                    )
             result = await app.state.memory.delete_bank(
                 bank_id, fact_type=type, delete_bank_profile=False, request_context=request_context
             )
