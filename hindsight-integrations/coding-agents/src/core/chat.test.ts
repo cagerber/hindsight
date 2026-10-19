@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { RateLimitedError, type HindsightClient } from "./hindsight";
 import {
@@ -218,7 +221,7 @@ describe("retainLiveSession — incremental write-back", () => {
   const turn = (i: number): TransportTurn => ({ role: "user", content: `turn ${i}` });
   const turns = (n: number) => Array.from({ length: n }, (_, i) => turn(i));
 
-  /** Client double: `supported` is what GET /version would have told us about operation_id. */
+  /** Client double: `supported` is the combined append capability. */
   const stubClient = (supported = true) => {
     const retain = vi.fn().mockResolvedValue(undefined);
     return {
@@ -226,13 +229,47 @@ describe("retainLiveSession — incremental write-back", () => {
       client: {
         retain,
         bank: "coding-agent::repo",
-        supportsIdempotentRetain: async () => supported,
+        supportsAppendRetain: async () => supported,
       } as unknown as HindsightClient,
     };
   };
 
   const write = (client: HindsightClient, turnList: TransportTurn[], cursors: RetainCursorStore) =>
     retainLiveSession(client, "s1", turnList, "2026-01-01T00:00:00Z", "codex", { cursors });
+
+  it("replaces when an accepted write's operation later failed (#5251)", async () => {
+    const status = new Map<string, string>();
+    const { retain, client } = stubClient();
+    Object.assign(client, {
+      bankUrl: (s: string) => s,
+      req: vi.fn(async (_m: string, url: string) => {
+        const st = status.get(url.split("/").pop()!);
+        return new Response(JSON.stringify({ status: st }), { status: st ? 200 : 404 });
+      }),
+    });
+    const cursors = memoryCursorStore();
+    const opOf = (call: number) => retain.mock.calls[call][5].operationId as string;
+
+    await write(client, turns(2), cursors);
+    status.set(opOf(0), "completed");
+    await write(client, turns(3), cursors);
+    expect(retain.mock.calls[1][5].updateMode).toBe("append"); // completed: append is safe
+    expect(cursors.read("s1")?.ops).toEqual([opOf(1)]);
+
+    status.set(opOf(1), "failed"); // accepted, then extraction failed
+    await write(client, turns(4), cursors);
+    // The failed append's turn 2 is re-sent: the whole transcript, as a replace.
+    expect(retain.mock.calls[2][5].updateMode).toBeUndefined();
+    expect(retain.mock.calls[2][0]).toBe(
+      renderSessionJsonl("conversation:s1", turns(4), "2026-01-01T00:00:00Z")
+    );
+    expect(cursors.read("s1")?.ops).toEqual([opOf(2)]);
+
+    status.set(opOf(2), "pending"); // still running: tracked, append proceeds
+    await write(client, turns(5), cursors);
+    expect(retain.mock.calls[3][5].updateMode).toBe("append");
+    expect(cursors.read("s1")?.ops).toEqual([opOf(2), opOf(3)]);
+  });
 
   it("replaces on the first write, then appends only the new turns", async () => {
     const { retain, client } = stubClient();
@@ -258,17 +295,40 @@ describe("retainLiveSession — incremental write-back", () => {
   it("remembers a confirmed append capability, so a failed probe on a later Stop still appends (#4560)", async () => {
     const cursors = memoryCursorStore();
     await write(stubClient().client, turns(2), cursors);
-    // The next Stop is a fresh hook process whose GET /version times out.
+    // The next Stop is a fresh hook process whose capability probe times out.
     const probe = vi.fn().mockRejectedValue(new Error("timeout"));
     const retain = vi.fn().mockResolvedValue(undefined);
     const next = {
       retain,
       bank: "coding-agent::repo",
-      supportsIdempotentRetain: probe,
+      supportsAppendRetain: probe,
     } as unknown as HindsightClient;
     await write(next, turns(4), cursors);
     expect(probe).not.toHaveBeenCalled();
     expect(retain.mock.calls[0][5].updateMode).toBe("append");
+  });
+
+  it("records the probed write-back mode in the diag trail, so a dead append is visible (#5286)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hs-chat-diag-"));
+    vi.stubEnv("HINDSIGHT_DIAG_FILE", join(dir, "diag.jsonl"));
+    try {
+      await write(stubClient(false).client, turns(2), memoryCursorStore());
+      const events = readFileSync(join(dir, "diag.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          harness: "codex",
+          event: "retain_mode",
+          mode: "replace",
+          appendSupported: false,
+        })
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("sends a stable v5 operation_id so a resubmitted write is not applied twice", async () => {
@@ -330,6 +390,8 @@ describe("retainLiveSession — incremental write-back", () => {
       fingerprint: expect.any(String),
       bank: "coding-agent::repo",
       appendSupported: true,
+      // Accepted but never seen to complete (this stub cannot answer a status check): kept to check.
+      ops: expect.arrayContaining([replay[5].operationId, tail[5].operationId]),
     });
   });
 
@@ -407,7 +469,7 @@ describe("retainLiveSession — incremental write-back", () => {
     expect(cursors.read("s1")?.pending).toBeUndefined();
   });
 
-  it("never appends against a server that ignores operation_id", async () => {
+  it("never appends when append support is unavailable", async () => {
     const { retain, client } = stubClient(false);
     const cursors = memoryCursorStore();
     await write(client, turns(2), cursors);
@@ -439,7 +501,7 @@ describe("retainLiveSession — incremental write-back", () => {
     const client = {
       retain,
       bank: "b",
-      supportsIdempotentRetain: async () => true,
+      supportsAppendRetain: async () => true,
     } as unknown as HindsightClient;
     const cursors = memoryCursorStore();
 
@@ -494,7 +556,7 @@ describe("retainLiveSession — incremental write-back", () => {
     const mk = (bank: string) =>
       ({
         bank,
-        supportsIdempotentRetain: async () => true,
+        supportsAppendRetain: async () => true,
         retain: vi.fn(async (_c: string, ...rest: unknown[]) => {
           sent.push({ bank, mode: (rest[4] as { updateMode?: string }).updateMode ?? "replace" });
         }),
@@ -650,7 +712,7 @@ describe("retainLiveSession — incremental write-back", () => {
     const client = {
       retain,
       bank: "b",
-      supportsIdempotentRetain: async () => {
+      supportsAppendRetain: async () => {
         throw new Error("unreachable");
       },
     } as unknown as HindsightClient;

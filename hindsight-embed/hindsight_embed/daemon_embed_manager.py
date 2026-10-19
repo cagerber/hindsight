@@ -145,6 +145,47 @@ def _probe(url: str, read: float) -> ProbeResponse | None:
     return probe_get(url, read_timeout=read, connect_timeout=min(read, PROBE_CONNECT_TIMEOUT))
 
 
+# Interpreter-selection variables of the *parent* process. They are meaningful
+# only for the interpreter that set them; forwarding them to a child that runs a
+# different interpreter makes that child import the parent's packages.
+_PARENT_INTERPRETER_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSAFEPATH", "VIRTUAL_ENV")
+
+
+def _runs_a_foreign_interpreter(cmd: list[str]) -> bool:
+    """Whether *cmd* launches hindsight-api on an interpreter that is not ours.
+
+    True for every uv-launched form — the ``uvx hindsight-api@<version>`` fallback and the
+    monorepo ``uv run --project <api-slim> ... hindsight-api`` dev command — because uv resolves
+    an environment of its own, usually on a different Python than the caller. False for the
+    installed-binary paths, which are a single executable from an environment we already share.
+
+    Matched on the basename, not the literal string: the sibling candidate paths in
+    ``_find_api_command`` are returned resolved (``[str(candidate)]``), so a future change that
+    resolves the launcher the same way must not silently stop scrubbing the env.
+    """
+    return Path(cmd[0]).stem in {"uv", "uvx"}
+
+
+def _strip_parent_interpreter_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop the parent interpreter's PYTHONPATH/PYTHONHOME/VIRTUAL_ENV from *env*.
+
+    Only for the uv-launched commands, which run in an environment uv
+    builds for them, usually on a different Python than the caller. Hosts that
+    locate their own site-packages through PYTHONPATH (Hermes' package-manager
+    install exports its Python 3.14 generation that way) otherwise hand that
+    directory to uvx's 3.12 interpreter, which then imports the host's pydantic
+    and dies on the missing compiled extension::
+
+        ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'
+
+    The installed-binary paths keep the env untouched: a ``pip install --target``
+    layout (issue #1240) relies on PYTHONPATH to find hindsight_api at all, and a
+    binary from the caller's own venv runs the same interpreter, so nothing there
+    is foreign.
+    """
+    return {key: value for key, value in env.items() if key not in _PARENT_INTERPRETER_ENV}
+
+
 def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
     """Cross-platform kwargs to spawn a subprocess detached from the caller.
 
@@ -152,9 +193,11 @@ def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
     survives the parent's terminal; `stdin` is pinned to /dev/null so the
     child never inherits a caller fd 0 that may be CLOEXEC (closed at exec,
     leaving ``sys.stdin = None``). On Windows there is no setsid: we use
-    `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, which also means the
-    child has no console, so stdin/stdout/stderr MUST be redirected or any
-    write from the child crashes with "handle is invalid".
+    `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` so console launchers such
+    as uvx and their descendants share a windowless console. Previously,
+    `DETACHED_PROCESS` left the launcher without a console, so its children
+    could allocate a visible one (#4562). Do not combine the two flags:
+    Windows ignores `CREATE_NO_WINDOW` when `DETACHED_PROCESS` is also set.
 
     `log_handle` receives the child's stdout/stderr on both platforms so
     output never leaks into the parent's terminal (which would corrupt a
@@ -164,10 +207,10 @@ def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
         # Windows-only constants; use getattr so type checkers (e.g. ty) running
         # on Linux don't flag the attribute access. They're guaranteed present
         # at runtime because of the platform.system() guard above.
-        detached_process = getattr(subprocess, "DETACHED_PROCESS", 0)
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         create_new_process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         return {
-            "creationflags": detached_process | create_new_process_group,
+            "creationflags": create_no_window | create_new_process_group,
             "stdin": subprocess.DEVNULL,
             "stdout": log_handle,
             "stderr": subprocess.STDOUT,
@@ -209,6 +252,14 @@ def _terminate_startup_process(process: subprocess.Popen) -> None:
             process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
     except ProcessLookupError:
         return
+
+
+# Runs hindsight_api.main on a base interpreter after adding a venv's site-packages (argv[1])
+# the way the venv itself would, .pth files included. Arguments after it reach the module.
+_VENV_SITE_BOOTSTRAP = (
+    "import runpy, site, sys; site.addsitedir(sys.argv.pop(1)); "
+    "runpy.run_module('hindsight_api.main', run_name='__main__', alter_sys=True)"
+)
 
 
 @dataclass(frozen=True)
@@ -313,10 +364,10 @@ class DaemonEmbedManager(EmbedManager):
         uv does not put a real interpreter in a venv's Scripts dir: the small
         ``pythonw.exe`` there is a trampoline that CreateProcess's the base
         interpreter recorded in ``pyvenv.cfg``. That relaunch lands on the CUI
-        ``python.exe`` and allocates the console our DETACHED_PROCESS flags were
-        meant to prevent — the flags applied to the trampoline, not to the
-        process the trampoline went on to spawn (issue #4466). Launching the
-        base pythonw.exe ourselves keeps the whole tree GUI-subsystem.
+        ``python.exe``, which allocates a visible console because the
+        ``CREATE_NO_WINDOW`` flag applied to the trampoline, not to the process
+        the trampoline went on to spawn (issue #4466). Launching the base
+        pythonw.exe ourselves keeps the whole tree GUI-subsystem.
 
         Returns None unless pyvenv.cfg carries uv's own ``uv =`` marker: a
         stdlib venv's pythonw.exe is the GUI venvwlauncher, which already
@@ -343,8 +394,8 @@ class DaemonEmbedManager(EmbedManager):
         return None
 
     @staticmethod
-    def _windows_gui_interpreter(preferred_dir: Path | None = None, env: dict[str, str] | None = None) -> str | None:
-        """Path to the GUI-subsystem Python (pythonw.exe), or None.
+    def _windows_gui_api_command(preferred_dir: Path | None = None) -> list[str] | None:
+        """Command that runs ``hindsight_api.main`` on the GUI-subsystem Python (pythonw.exe), or None.
 
         Returns None on non-Windows, or when pythonw.exe can't be located next
         to the preferred scripts directory or running interpreter.
@@ -358,9 +409,13 @@ class DaemonEmbedManager(EmbedManager):
         that contains hindsight-api.exe because wrapper entry points can make
         sys.executable point at a different launcher directory (issue #2389).
 
-        When the pythonw we find is a uv trampoline and ``env`` is a writable
-        dict, resolve the base interpreter instead and put the venv's
-        site-packages on PYTHONPATH so hindsight_api stays importable (#4466).
+        When the pythonw we find is a uv trampoline, run the base interpreter
+        instead (#4466) and add the venv's site-packages with
+        ``site.addsitedir`` before running the module. This used to put
+        site-packages on PYTHONPATH, which makes it importable but never
+        processes its ``.pth`` files: ``pywin32.pth`` (DLL search path for
+        ``pywintypes``) and the files that wire up fastmcp were skipped, and the
+        daemon died on import (#4974, #5025). ``addsitedir`` handles both.
         """
         if platform.system() != "Windows":
             return None
@@ -375,14 +430,11 @@ class DaemonEmbedManager(EmbedManager):
             # Only bypass the trampoline when we can hand the base interpreter
             # the venv's packages: without them it can't import hindsight_api,
             # and a daemon that won't start is worse than a console flash.
-            if target is not None and env is not None:
+            if target is not None:
                 site_packages = target.venv_root / "Lib" / "site-packages"
                 if site_packages.is_dir():
-                    env["PYTHONPATH"] = os.pathsep.join(
-                        part for part in (str(site_packages), env.get("PYTHONPATH", "")) if part
-                    )
-                    return target.base_pythonw
-            return str(pythonw)
+                    return [target.base_pythonw, "-c", _VENV_SITE_BOOTSTRAP, str(site_packages)]
+            return [str(pythonw), "-m", "hindsight_api.main"]
         return None
 
     def _component_version(self, profile: str, env_key: str) -> str:
@@ -443,10 +495,7 @@ class DaemonEmbedManager(EmbedManager):
             # The console exe lives in sys.executable's scripts dir, so
             # hindsight_api is importable by the GUI interpreter; prefer it on
             # Windows to avoid ConPTY popping a terminal tab (issue #1885).
-            gui_python = self._windows_gui_interpreter(scripts_dir, env if isinstance(env, dict) else None)
-            if gui_python is not None:
-                return [gui_python, "-m", "hindsight_api.main"]
-            return [str(candidate)]
+            return self._windows_gui_api_command(scripts_dir) or [str(candidate)]
 
         # --target installs place binaries alongside site-packages contents.
         # The running interpreter usually can't import hindsight_api here (it's
@@ -898,6 +947,8 @@ class DaemonEmbedManager(EmbedManager):
         ]
         if extra_args:
             cmd.extend(extra_args)
+        if _runs_a_foreign_interpreter(cmd):
+            env = _strip_parent_interpreter_env(env)
 
         try:
             # Start daemon. Redirect stdout/stderr to the daemon log so that

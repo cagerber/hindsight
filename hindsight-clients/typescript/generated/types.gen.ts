@@ -589,6 +589,18 @@ export type BankTemplateConfig = {
    */
   enable_reranking?: boolean | null;
   /**
+   * Reflect Use Decision Model
+   *
+   * When the server has a decision model, reflect lets it prune evidence and decide when to stop
+   */
+  reflect_use_decision_model?: boolean | null;
+  /**
+   * Mental Model Refresh Use Decision Model
+   *
+   * The same, for knowledge-page refreshes
+   */
+  mental_model_refresh_use_decision_model?: boolean | null;
+  /**
    * Disposition Skepticism
    *
    * Skepticism trait (1-5)
@@ -795,6 +807,12 @@ export type BankTemplateConfig = {
    */
   enable_auto_consolidation?: boolean | null;
   /**
+   * Consolidation Use Decision Model
+   *
+   * When the server has a decision model, consolidation lets it settle restatements, new facets and chatter before the LLM call
+   */
+  consolidation_use_decision_model?: boolean | null;
+  /**
    * Consolidation Max Memories Per Round
    *
    * Max memory units fed into a single consolidation round
@@ -812,6 +830,12 @@ export type BankTemplateConfig = {
    * Include raw chunks in recall results
    */
   recall_include_chunks?: boolean | null;
+  /**
+   * Recall Prefer Observations
+   *
+   * Default for recall prefer_observations when the request omits it
+   */
+  recall_prefer_observations?: boolean | null;
   /**
    * Recall Max Tokens
    *
@@ -1467,7 +1491,7 @@ export type CreateBankAliasRequest = {
   /**
    * Alias
    *
-   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters), and it must not already name a bank or another alias.
+   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters, no leading underscore), and it must not already name a bank or another alias.
    */
   alias: string;
   /**
@@ -2105,6 +2129,12 @@ export type DocumentListItem = {
    * Tags associated with this document
    */
   tags?: Array<string>;
+  /**
+   * Matched Fields
+   *
+   * Which fields matched the `q` search: 'id', 'original_text', or both. Empty when no `q` is given.
+   */
+  matched_fields?: Array<"id" | "original_text">;
 };
 
 /**
@@ -2946,7 +2976,7 @@ export type KnowledgeNode = {
    */
   last_refresh_failed_at?: string | null;
   /**
-   * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
+   * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`, plus any `full_refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
    */
   trigger?: MentalModelTriggerOutput | null;
   /**
@@ -3472,6 +3502,12 @@ export type ListDocumentsResponse = {
    * Offset
    */
   offset: number;
+  /**
+   * Total Is Estimate
+   *
+   * True when a `q` search stopped at its match cap, so `total` is a lower bound rather than an exact count. Always false without `q`.
+   */
+  total_is_estimate?: boolean;
 };
 
 /**
@@ -3923,7 +3959,7 @@ export type MemoryItem = {
   /**
    * Document Id
    *
-   * Optional document ID for this memory item. Provide a distinct document_id per source document — items sharing a document_id are grouped into the same document. Auto-generated when omitted.
+   * Optional document ID for this memory item. Provide a distinct document_id per source document — items sharing a document_id are grouped into the same document. Auto-generated when omitted: if no item in the request has one, they all share one generated document (a request split into parts for size gets one per part); otherwise each item without one gets its own.
    */
   document_id?: string | null;
   /**
@@ -4583,9 +4619,15 @@ export type MentalModelResponse = {
   /**
    * Last Refresh Failed At
    *
-   * When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history.
+   * When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history.
    */
   last_refresh_failed_at?: string | null;
+  /**
+   * Last Full Refreshed At
+   *
+   * When a refresh last ran in full mode for this model, in ISO format — requested (`mode: 'full'`, a `full_refresh_cron` tick, a full-mode model) or fallen back to by a delta refresh. `trigger.full_refresh_cron` comes due against this, not `last_refreshed_at`, which every delta refresh moves. Null when no full refresh has completed since this was first tracked.
+   */
+  last_full_refreshed_at?: string | null;
   /**
    * Created At
    */
@@ -4714,23 +4756,18 @@ export type MentalModelTraceToolCall = {
  *
  * Trigger settings for a mental model.
  *
- * Inherits the reflect options an operator can also default per bank
- * (``reflect_default_options``): set here they apply to this model's refreshes
- * only, and win over the bank default.
+ * A refresh is not an ad-hoc reflect with different arguments: it synthesizes a
+ * whole document, so it wants its own retrieval and iteration settings. This
+ * trigger is therefore the only source for them — a bank's
+ * ``reflect_default_options`` deliberately does not reach a refresh. The
+ * per-bank default for these fields is ``knowledge_page_default_trigger``,
+ * which is merged over this same shape when a page is created.
  */
 export type MentalModelTriggerInput = {
   /**
-   * Reflect Search Observations Max Tokens
-   *
-   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   * How many agent iterations a refresh may spend, as a multiple of reflect_max_iterations: 'low' halves it, 'mid' keeps it, 'high' doubles it. A refresh is the heaviest reflect there is — it writes a whole document, and with exclude_mental_models it must read raw facts first — so null means 'mid', not the 'low' an ad-hoc reflect defaults to.
    */
-  reflect_search_observations_max_tokens?: number | null;
-  /**
-   * Reflect Search Observations Include Entities
-   *
-   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
-   */
-  reflect_search_observations_include_entities?: boolean | null;
+  budget?: Budget | null;
   /**
    * Mode
    *
@@ -4750,9 +4787,15 @@ export type MentalModelTriggerInput = {
    */
   refresh_cron?: string | null;
   /**
+   * Full Refresh Cron
+   *
+   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` — a delta model can refresh after consolidation and still get a weekly full refresh — and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule.
+   */
+  full_refresh_cron?: string | null;
+  /**
    * Min Refresh Interval Seconds
    *
-   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
+   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
    */
   min_refresh_interval_seconds?: number | null;
   /**
@@ -4776,7 +4819,7 @@ export type MentalModelTriggerInput = {
   /**
    * Tags Match
    *
-   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match.
+   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match. Staleness ignores that widening: an untagged write never marks a tagged model stale, in any mode — only a write that matches the model's tags does.
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact" | null;
   /**
@@ -4804,6 +4847,18 @@ export type MentalModelTriggerInput = {
    */
   recall_chunks_max_tokens?: number | null;
   /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Override the token budget for the refresh's search_observations calls. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. null means the shipped 5000.
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Override whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. null means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
+  /**
    * Response Schema
    *
    * Optional JSON Schema for structured output. When set, each refresh runs the same structured-output extraction as reflect's response_schema and stores the parsed result under reflect_response.structured_output alongside the markdown content.
@@ -4824,23 +4879,18 @@ export type MentalModelTriggerInput = {
  *
  * Trigger settings for a mental model.
  *
- * Inherits the reflect options an operator can also default per bank
- * (``reflect_default_options``): set here they apply to this model's refreshes
- * only, and win over the bank default.
+ * A refresh is not an ad-hoc reflect with different arguments: it synthesizes a
+ * whole document, so it wants its own retrieval and iteration settings. This
+ * trigger is therefore the only source for them — a bank's
+ * ``reflect_default_options`` deliberately does not reach a refresh. The
+ * per-bank default for these fields is ``knowledge_page_default_trigger``,
+ * which is merged over this same shape when a page is created.
  */
 export type MentalModelTriggerOutput = {
   /**
-   * Reflect Search Observations Max Tokens
-   *
-   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   * How many agent iterations a refresh may spend, as a multiple of reflect_max_iterations: 'low' halves it, 'mid' keeps it, 'high' doubles it. A refresh is the heaviest reflect there is — it writes a whole document, and with exclude_mental_models it must read raw facts first — so null means 'mid', not the 'low' an ad-hoc reflect defaults to.
    */
-  reflect_search_observations_max_tokens?: number | null;
-  /**
-   * Reflect Search Observations Include Entities
-   *
-   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
-   */
-  reflect_search_observations_include_entities?: boolean | null;
+  budget?: Budget | null;
   /**
    * Mode
    *
@@ -4860,9 +4910,15 @@ export type MentalModelTriggerOutput = {
    */
   refresh_cron?: string | null;
   /**
+   * Full Refresh Cron
+   *
+   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` — a delta model can refresh after consolidation and still get a weekly full refresh — and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule.
+   */
+  full_refresh_cron?: string | null;
+  /**
    * Min Refresh Interval Seconds
    *
-   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
+   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
    */
   min_refresh_interval_seconds?: number | null;
   /**
@@ -4886,7 +4942,7 @@ export type MentalModelTriggerOutput = {
   /**
    * Tags Match
    *
-   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match.
+   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match. Staleness ignores that widening: an untagged write never marks a tagged model stale, in any mode — only a write that matches the model's tags does.
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact" | null;
   /**
@@ -4915,6 +4971,18 @@ export type MentalModelTriggerOutput = {
    * Override the token budget for raw chunks returned by the internal recall during refresh. None means use the bank/global config default (recall_chunks_max_tokens).
    */
   recall_chunks_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Override the token budget for the refresh's search_observations calls. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. null means the shipped 5000.
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Override whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. null means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
   /**
    * Response Schema
    *
@@ -4977,7 +5045,7 @@ export type MinScores = {
   /**
    * Reranker
    *
-   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result.
+   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result. Rejected with HTTP 400 when the reranker scores by rank position (TypeSafe), since a floor would only keep a fixed share of the results.
    */
   reranker?: number | null;
   /**
@@ -5101,6 +5169,18 @@ export type OperationResponse = {
    */
   task_type: string;
   /**
+   * Operation Id
+   *
+   * Same as `id`; the name the single-operation read uses.
+   */
+  operation_id?: string | null;
+  /**
+   * Operation Type
+   *
+   * Same as `task_type`; the name the single-operation read uses.
+   */
+  operation_type?: string | null;
+  /**
    * Items Count
    */
   items_count: number;
@@ -5117,7 +5197,7 @@ export type OperationResponse = {
   /**
    * Mental Model Id
    *
-   * Mental model this operation acted on (refresh_mental_model); null for other task types. Without it the list cannot say which model an operation refreshed — `document_id` is null for these, and the list carries no result_metadata. The single-operation read exposes the same value under `result_metadata`.
+   * Mental model this operation acted on (refresh_mental_model); null for other task types. Without it the list cannot say which model an operation refreshed — `document_id` is null for these, and the list carries no result_metadata.
    */
   mental_model_id?: string | null;
   /**
@@ -5178,6 +5258,24 @@ export type OperationStatusResponse = {
    * Operation Type
    */
   operation_type?: string | null;
+  /**
+   * Id
+   *
+   * Same as `operation_id`; the name the operations list uses.
+   */
+  id?: string | null;
+  /**
+   * Task Type
+   *
+   * Same as `operation_type`; the name the operations list uses.
+   */
+  task_type?: string | null;
+  /**
+   * Mental Model Id
+   *
+   * Mental model this operation acted on (refresh_mental_model); null for other task types.
+   */
+  mental_model_id?: string | null;
   /**
    * Created At
    */
@@ -5461,9 +5559,9 @@ export type RecallRequest = {
   /**
    * Prefer Observations
    *
-   * When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. Disabled by default; set to true to enable. No effect unless 'observation' and at least one raw type are both requested.
+   * When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. When omitted, uses the bank/global recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested.
    */
-  prefer_observations?: boolean;
+  prefer_observations?: boolean | null;
   budget?: Budget;
   /**
    * Max Tokens
@@ -6102,6 +6200,20 @@ export type RefreshMentalModelOperationDetails = {
 };
 
 /**
+ * RefreshMentalModelRequest
+ *
+ * Optional body of POST /mental-models/{id}/refresh.
+ */
+export type RefreshMentalModelRequest = {
+  /**
+   * Mode
+   *
+   * 'full' regenerates the content from scratch for this refresh only, whatever `trigger.mode` says; the stored trigger is not changed. null runs the model's own mode.
+   */
+  mode?: "full" | null;
+};
+
+/**
  * ReprocessDocumentResponse
  *
  * Response model for reprocess document endpoint.
@@ -6643,6 +6755,18 @@ export type UpdateDocumentRequest = {
    * The complete new set of tags for the document and its memory units — this REPLACES the existing tags rather than adding to them, so omitting a tag drops it and `[]` clears them all. Triggers observation invalidation and re-consolidation.
    */
   tags?: Array<string> | null;
+  /**
+   * UpdateDocumentObservationScopes
+   *
+   * New observation scoping for the document's memories, with the same values retain accepts (send 'combined' to return to the default). Use it to move memories retained under one scoping to another — e.g. per-session documents to 'shared' — without re-extracting them. Memories whose resolved scopes change lose their observations and are re-consolidated; the rest keep theirs. Also becomes the scoping a later reprocess of the document uses.
+   */
+  observation_scopes?:
+    | "per_tag"
+    | "combined"
+    | "all_combinations"
+    | "shared"
+    | Array<Array<string>>
+    | null;
 };
 
 /**
@@ -6903,6 +7027,10 @@ export type WebhookDeliveryResponse = {
    * Id
    */
   id: string;
+  /**
+   * Event Id
+   */
+  event_id?: string | null;
   /**
    * Webhook Id
    */
@@ -7170,7 +7298,7 @@ export type GetGraphData = {
     /**
      * Tags Match
      */
-    tags_match?: string;
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     /**
      * Document Id
      */
@@ -7784,6 +7912,24 @@ export type ListEntitiesData = {
      * Offset for pagination
      */
     offset?: number;
+    /**
+     * Tags
+     *
+     * Only count memories carrying these tags. An entity is returned only when a matching memory mentions it, and its mention count and dates cover the matching memories only.
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match (same modes as listing memories).
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * Compound tag filter as a JSON-encoded list of tag groups — the same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve} and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually exclusive with `tags`.
+     */
+    tag_groups?: string | null;
   };
   url: "/v1/default/banks/{bank_id}/entities";
 };
@@ -7837,6 +7983,24 @@ export type GetEntityGraphData = {
      * Minimum cooccurrence_count to include an edge
      */
     min_count?: number;
+    /**
+     * Tags
+     *
+     * Only count memories carrying these tags. Edges and node mention counts are computed from the matching memories only.
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match (same modes as listing memories).
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * Compound tag filter as a JSON-encoded list of tag groups — the same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve} and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually exclusive with `tags`.
+     */
+    tag_groups?: string | null;
   };
   url: "/v1/default/banks/{bank_id}/entities/graph";
 };
@@ -7881,7 +8045,26 @@ export type GetEntityData = {
      */
     entity_id: string;
   };
-  query?: never;
+  query?: {
+    /**
+     * Tags
+     *
+     * Only count memories carrying these tags. The entity is a 404 when no matching memory mentions it; its mention count and dates cover the matching memories only.
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match (same modes as listing memories).
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * Compound tag filter as a JSON-encoded list of tag groups — the same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve} and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually exclusive with `tags`.
+     */
+    tag_groups?: string | null;
+  };
   url: "/v1/default/banks/{bank_id}/entities/{entity_id}";
 };
 
@@ -8215,7 +8398,10 @@ export type GetMentalModelHistoryResponses = {
 };
 
 export type RefreshMentalModelData = {
-  body?: never;
+  /**
+   * Request
+   */
+  body?: RefreshMentalModelRequest | null;
   headers?: {
     /**
      * Authorization
@@ -8351,7 +8537,26 @@ export type GetKnowledgeBaseTreeData = {
      */
     bank_id: string;
   };
-  query?: never;
+  query?: {
+    /**
+     * Tags
+     *
+     * Only return pages carrying these tags (matched per `tags_match`, like recall).
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match a page's tags: any, all, any_strict, all_strict, exact. 'any'/'all' also return untagged pages; the _strict modes and 'exact' do not.
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. `[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. Top-level groups are AND-ed, and AND-ed with `tags`.
+     */
+    tag_groups?: string | null;
+  };
   url: "/v1/default/banks/{bank_id}/knowledge-base/tree";
 };
 
@@ -8522,6 +8727,24 @@ export type SearchKnowledgeBaseData = {
      * Maximum results to return
      */
     limit?: number;
+    /**
+     * Tags
+     *
+     * Only return pages carrying these tags (matched per `tags_match`, like recall).
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match a page's tags: any, all, any_strict, all_strict, exact. 'any'/'all' also return untagged pages; the _strict modes and 'exact' do not.
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. `[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. Top-level groups are AND-ed, and AND-ed with `tags`.
+     */
+    tag_groups?: string | null;
   };
   url: "/v1/default/banks/{bank_id}/knowledge-base/search";
 };
@@ -8907,7 +9130,7 @@ export type ListDocumentsData = {
     /**
      * Q
      *
-     * Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')
+     * Case-insensitive substring filter on document ID or document text (e.g. 'report' matches 'report-2024' or any document containing 'report'). Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that. Matches are capped: past the cap, `total` is a lower bound and `total_is_estimate` is true. A store-owned backend may match approximately; each item's `matched_fields` says what matched.
      */
     q?: string | null;
     /**
@@ -8919,9 +9142,9 @@ export type ListDocumentsData = {
     /**
      * Tags Match
      *
-     * How to match tags: 'any', 'all', 'any_strict', 'all_strict'
+     * How to match tags: 'any', 'all', 'any_strict', 'all_strict', 'exact'
      */
-    tags_match?: string;
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     /**
      * Time Field
      *

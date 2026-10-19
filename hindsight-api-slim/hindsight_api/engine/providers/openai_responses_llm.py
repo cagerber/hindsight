@@ -36,7 +36,7 @@ import json
 import logging
 import time
 from contextlib import AbstractAsyncContextManager, nullcontext
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI
@@ -64,6 +64,7 @@ from hindsight_api.engine.providers.openai_compatible_llm import (
     _strip_code_fences,
     _strip_reasoning_tags,
 )
+from hindsight_api.engine.remote_retry import jittered_backoff
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
@@ -72,6 +73,13 @@ from hindsight_api.worker.stage import set_stage
 from ..response_models import LLMCallResult
 
 logger = logging.getLogger(__name__)
+
+
+class RetryableResponsesError(Exception):
+    """A transient failure a subclass detected outside an HTTP status (e.g. mid-stream).
+
+    ``_run_with_retries`` backs off and retries it like a connection error.
+    """
 
 
 def _tools_to_responses(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -345,6 +353,14 @@ class OpenAIResponsesLLM(LLMInterface):
             tool_calls=tool_calls_dict,
         )
 
+    async def _create_response(self, params: dict[str, Any]) -> Any:
+        """Send one Responses request and return the final response object.
+
+        The hook subclasses override to change transport (``chatgpt`` streams
+        and swaps the bearer token per call); everything around it stays shared.
+        """
+        return await self._client.responses.create(**params)
+
     async def _run_with_retries(
         self,
         params: dict[str, Any],
@@ -372,7 +388,7 @@ class OpenAIResponsesLLM(LLMInterface):
                     # Wall-clock cap: the SDK's timeout is per phase and its read timeout restarts
                     # on every byte, so an upstream trickling keep-alive whitespace never trips it
                     # and the call pins its worker slot forever (#4763).
-                    response = await asyncio.wait_for(self._client.responses.create(**params), timeout=self.timeout)
+                    response = await asyncio.wait_for(self._create_response(params), timeout=self.timeout)
                 usage = self._extract_usage(response)
                 stash_response_usage(
                     LLMResponseUsage(
@@ -396,7 +412,7 @@ class OpenAIResponsesLLM(LLMInterface):
                     continue
                 raise
 
-            except (APIConnectionError, TimeoutError) as e:
+            except (APIConnectionError, TimeoutError, RetryableResponsesError) as e:
                 last_exception = e
                 status_code = getattr(e, "status_code", None) or getattr(
                     getattr(e, "response", None), "status_code", None
@@ -426,9 +442,7 @@ class OpenAIResponsesLLM(LLMInterface):
                         f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
                         f"attempt {attempt + 1}/{max_retries + 1}): HTTP {e.status_code}"
                     )
-                    backoff = min(initial_backoff * (2**attempt), max_backoff)
-                    jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                    await asyncio.sleep(backoff + jitter)
+                    await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
                     continue
                 logger.error(
                     f"API error after {max_retries + 1} attempts "
@@ -455,7 +469,7 @@ class OpenAIResponsesLLM(LLMInterface):
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMCallResult:
         """Make a Responses API call with retry logic (see ``LLMInterface.call``)."""
-        start_time = time.time()
+        start_time = time.perf_counter()
         is_reasoning_model = self._supports_reasoning_model()
 
         input_items = _messages_to_responses_input(messages)
@@ -503,7 +517,7 @@ class OpenAIResponsesLLM(LLMInterface):
         def parse(response: Any) -> Any:
             self._raise_if_truncated(response)
             usage = self._extract_usage(response)
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
             content = _strip_reasoning_tags(response.output_text or "")
 
             if response_format is not None:
@@ -555,7 +569,7 @@ class OpenAIResponsesLLM(LLMInterface):
         Unlike chat/completions, ``reasoning`` and ``tools`` are sent together —
         the reason this provider exists.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         is_reasoning_model = self._supports_reasoning_model()
 
         responses_tools = _tools_to_responses(tools)
@@ -613,7 +627,7 @@ class OpenAIResponsesLLM(LLMInterface):
         def parse(response: Any) -> LLMToolCallResult:
             self._raise_if_truncated(response)
             usage = self._extract_usage(response)
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
 
             tool_calls: list[LLMToolCall] = []
             for item in getattr(response, "output", None) or []:
@@ -625,7 +639,12 @@ class OpenAIResponsesLLM(LLMInterface):
                 except json.JSONDecodeError:
                     arguments = {"_raw": raw_args}
                 tool_calls.append(
-                    LLMToolCall(id=getattr(item, "call_id", None), name=getattr(item, "name", ""), arguments=arguments)
+                    # `call_id` is present on every function-call item this branch selects.
+                    LLMToolCall(
+                        id=cast(str, getattr(item, "call_id", None)),
+                        name=getattr(item, "name", ""),
+                        arguments=arguments,
+                    )
                 )
 
             content = response.output_text or None

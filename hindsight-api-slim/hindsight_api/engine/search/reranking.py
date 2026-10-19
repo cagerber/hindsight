@@ -8,7 +8,9 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from ..cross_encoder import _served_provider
+from ..cross_encoder import RerankTimeoutError, _served_provider
+from .decision_reranker import PROVIDER_NAME as DECISION_MODEL_RERANKER
+from .decision_reranker import DecisionModelReranker, rerank_shared_context
 from .types import MergedCandidate, ScoredResult
 
 logger = logging.getLogger(__name__)
@@ -321,9 +323,16 @@ class CrossEncoderReranker:
                           environment variables (defaults to local provider)
         """
         if cross_encoder is None:
+            from hindsight_api.config import get_config
             from hindsight_api.engine.cross_encoder import create_cross_encoder_from_env
 
-            cross_encoder = create_cross_encoder_from_env()
+            # A decision model set up for recall replaces the configured reranker outright.
+            decision_model = get_config().decision_model_config("recall")
+            cross_encoder = (
+                DecisionModelReranker.from_config(decision_model)
+                if decision_model is not None
+                else create_cross_encoder_from_env()
+            )
         self.cross_encoder = cross_encoder
         self._initialized = False
 
@@ -361,13 +370,15 @@ class CrossEncoderReranker:
             ) from e
         self._initialized = True
 
-    async def rerank(self, query: str, candidates: list[MergedCandidate]) -> RerankResult:
+    async def rerank(self, query: str, candidates: list[MergedCandidate], now: datetime | None = None) -> RerankResult:
         """
         Rerank candidates using cross-encoder scores.
 
         Args:
             query: Search query
             candidates: Merged candidates from RRF
+            now: When the question is asked (the recall's question date), told to a decision
+                model so it can weigh how recent each candidate is. Defaults to now.
 
         Returns:
             Scored results sorted by cross-encoder score, and the provider that
@@ -379,6 +390,19 @@ class CrossEncoderReranker:
                 provider_name=getattr(self.cross_encoder, "provider_name", None),
             )
 
+        # A decision model is handed what the candidates all share once, in the question's
+        # state, instead of pasted onto every candidate — see rerank_shared_context: the
+        # date the question is asked, and their context when there is exactly one. With
+        # several, each candidate keeps its own prefix, because then the difference
+        # between them is information.
+        shared_context = None
+        pooled_context = None
+        if getattr(self.cross_encoder, "provider_name", None) == DECISION_MODEL_RERANKER:
+            contexts = {c.retrieval.context for c in candidates if c.retrieval.context}
+            pooled_context = next(iter(contexts)) if len(contexts) == 1 else None
+            today = f"Current date: {(now or datetime.now(timezone.utc)).date().isoformat()}"
+            shared_context = f"{today}\n\n{pooled_context}" if pooled_context else today
+
         # Prepare query-document pairs with date information
         pairs = []
         for candidate in candidates:
@@ -386,7 +410,7 @@ class CrossEncoderReranker:
 
             # Use text + context for better ranking
             doc_text = retrieval.text
-            if retrieval.context:
+            if retrieval.context and not pooled_context:
                 doc_text = f"{retrieval.context}: {doc_text}"
 
             # Add formatted date information for temporal awareness
@@ -407,11 +431,23 @@ class CrossEncoderReranker:
 
         # Get cross-encoder scores. A failover chain records the member that
         # served this task; read it before anything else on the chain can move.
+        # An in-process model that runs out of wall-clock hands back what it managed
+        # to score (#4696); the rest keep their pre-rerank (RRF) order behind the
+        # scored ones rather than the recall never returning.
+        unscored: set[int] = set()
         token = _served_provider.set(None)
+        shared_context_token = rerank_shared_context.set(shared_context)
         try:
-            scores = await self.cross_encoder.predict(pairs)
+            try:
+                # The model takes 2-tuples; `pairs` is built as two-element lists.
+                scores = await self.cross_encoder.predict([(a, b) for a, b in pairs])
+            except RerankTimeoutError as exc:
+                logger.warning(f"Reranking: {exc}; ranking the remainder by RRF order")
+                unscored = {i for i, score in enumerate(exc.scores) if score is None}
+                scores = [0.0 if score is None else score for score in exc.scores]
             served_provider = _served_provider.get()
         finally:
+            rerank_shared_context.reset(shared_context_token)
             _served_provider.reset(token)
         if served_provider is None:
             # Single-member encoders do not record one. Their provider_name is
@@ -440,7 +476,8 @@ class CrossEncoderReranker:
 
         # Create ScoredResult objects with cross-encoder scores
         scored_results = []
-        for candidate, raw_score, norm_score in zip(candidates, scores, normalized_scores):
+        unscored_results = []
+        for index, (candidate, raw_score, norm_score) in enumerate(zip(candidates, scores, normalized_scores)):
             # Sanitize NaN scores (cross-encoder can return NaN for certain inputs).
             # NaN propagates through all downstream scoring and Pydantic serializes
             # NaN as JSON null, which breaks clients expecting numeric values.
@@ -450,16 +487,26 @@ class CrossEncoderReranker:
                 raw = 0.0
             if math.isnan(norm):
                 norm = 0.0
+            if index in unscored:
+                # Score 0.0, not sigmoid(0.0)=0.5: an unscored candidate has earned no
+                # confidence, and 0.5 would sail past a min_reranker_score threshold
+                # that a genuinely weak but *scored* candidate fails.
+                raw = norm = 0.0
             scored_result = ScoredResult(
                 candidate=candidate,
                 cross_encoder_score=raw,
                 cross_encoder_score_normalized=norm,
                 weight=norm,  # Initial weight is just cross-encoder score
             )
-            scored_results.append(scored_result)
+            if index in unscored:
+                unscored_results.append(scored_result)
+            else:
+                scored_results.append(scored_result)
 
         # Sort by cross-encoder score
         scored_results.sort(key=lambda x: x.weight, reverse=True)
+        # `candidates` arrives in RRF order, so appending preserves it for the tail.
+        scored_results.extend(unscored_results)
 
         if not self.cross_encoder.prunes_candidates:
             return RerankResult(results=scored_results, provider_name=served_provider)

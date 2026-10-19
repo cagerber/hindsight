@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.10.1
+  version: 1.0.0
 servers:
 - url: /
 paths:
@@ -142,6 +142,12 @@ paths:
         required: false
         schema:
           default: all_strict
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
           title: Tags Match
           type: string
         style: form
@@ -964,6 +970,48 @@ paths:
           title: Offset
           type: integer
         style: form
+      - description: "Only count memories carrying these tags. An entity is returned\
+          \ only when a matching memory mentions it, and its mention count and dates\
+          \ cover the matching memories only."
+        explode: true
+        in: query
+        name: tags
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - description: How `tags` match (same modes as listing memories).
+        explode: true
+        in: query
+        name: tags_match
+        required: false
+        schema:
+          default: any
+          description: How `tags` match (same modes as listing memories).
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
+          title: Tags Match
+          type: string
+        style: form
+      - description: "Compound tag filter as a JSON-encoded list of tag groups — the\
+          \ same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve}\
+          \ and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually\
+          \ exclusive with `tags`."
+        explode: true
+        in: query
+        name: tag_groups
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -1027,6 +1075,47 @@ paths:
           title: Min Count
           type: integer
         style: form
+      - description: Only count memories carrying these tags. Edges and node mention
+          counts are computed from the matching memories only.
+        explode: true
+        in: query
+        name: tags
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - description: How `tags` match (same modes as listing memories).
+        explode: true
+        in: query
+        name: tags_match
+        required: false
+        schema:
+          default: any
+          description: How `tags` match (same modes as listing memories).
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
+          title: Tags Match
+          type: string
+        style: form
+      - description: "Compound tag filter as a JSON-encoded list of tag groups — the\
+          \ same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve}\
+          \ and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually\
+          \ exclusive with `tags`."
+        explode: true
+        in: query
+        name: tag_groups
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -1075,6 +1164,48 @@ paths:
           title: Entity Id
           type: string
         style: simple
+      - description: Only count memories carrying these tags. The entity is a 404
+          when no matching memory mentions it; its mention count and dates cover the
+          matching memories only.
+        explode: true
+        in: query
+        name: tags
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - description: How `tags` match (same modes as listing memories).
+        explode: true
+        in: query
+        name: tags_match
+        required: false
+        schema:
+          default: any
+          description: How `tags` match (same modes as listing memories).
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
+          title: Tags Match
+          type: string
+        style: form
+      - description: "Compound tag filter as a JSON-encoded list of tag groups — the\
+          \ same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve}\
+          \ and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually\
+          \ exclusive with `tags`."
+        explode: true
+        in: query
+        name: tag_groups
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -1498,8 +1629,12 @@ paths:
       - Mental Models
   /v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh:
     post:
-      description: Submit an async task to re-run the source query through reflect
-        and update the content.
+      description: "Submit an async task to re-run the source query through reflect\
+        \ and update the content. With no body the refresh runs in the model's own\
+        \ `trigger.mode`. Send `{\"mode\": \"full\"}` for a full refresh: the content\
+        \ is regenerated from scratch this once (to clear the drift delta edits accumulate)\
+        \ while the stored trigger keeps its mode. Unlike clearing the model first,\
+        \ a full refresh that fails leaves the previous content in place."
       operationId: refresh_mental_model
       parameters:
       - explode: false
@@ -1526,6 +1661,11 @@ paths:
           nullable: true
           type: string
         style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshMentalModelRequest'
       responses:
         "200":
           content:
@@ -1653,6 +1793,50 @@ paths:
           title: Bank Id
           type: string
         style: simple
+      - description: "Only return pages carrying these tags (matched per `tags_match`,\
+          \ like recall)."
+        explode: true
+        in: query
+        name: tags
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - description: "How `tags` match a page's tags: any, all, any_strict, all_strict,\
+          \ exact. 'any'/'all' also return untagged pages; the _strict modes and 'exact'\
+          \ do not."
+        explode: true
+        in: query
+        name: tags_match
+        required: false
+        schema:
+          default: any
+          description: "How `tags` match a page's tags: any, all, any_strict, all_strict,\
+            \ exact. 'any'/'all' also return untagged pages; the _strict modes and\
+            \ 'exact' do not."
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
+          title: Tags Match
+          type: string
+        style: form
+      - description: "JSON-encoded compound tag filter, same shape as recall's `tag_groups`,\
+          \ e.g. `[{\"or\":[{\"tags\":[\"user:kate\"],\"match\":\"all_strict\"},{\"\
+          tags\":[\"team\"]}]}]`. Top-level groups are AND-ed, and AND-ed with `tags`."
+        explode: true
+        in: query
+        name: tag_groups
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -1844,6 +2028,50 @@ paths:
           minimum: 1
           title: Limit
           type: integer
+        style: form
+      - description: "Only return pages carrying these tags (matched per `tags_match`,\
+          \ like recall)."
+        explode: true
+        in: query
+        name: tags
+        required: false
+        schema:
+          items:
+            type: string
+          nullable: true
+          type: array
+        style: form
+      - description: "How `tags` match a page's tags: any, all, any_strict, all_strict,\
+          \ exact. 'any'/'all' also return untagged pages; the _strict modes and 'exact'\
+          \ do not."
+        explode: true
+        in: query
+        name: tags_match
+        required: false
+        schema:
+          default: any
+          description: "How `tags` match a page's tags: any, all, any_strict, all_strict,\
+            \ exact. 'any'/'all' also return untagged pages; the _strict modes and\
+            \ 'exact' do not."
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
+          title: Tags Match
+          type: string
+        style: form
+      - description: "JSON-encoded compound tag filter, same shape as recall's `tag_groups`,\
+          \ e.g. `[{\"or\":[{\"tags\":[\"user:kate\"],\"match\":\"all_strict\"},{\"\
+          tags\":[\"team\"]}]}]`. Top-level groups are AND-ed, and AND-ed with `tags`."
+        explode: true
+        in: query
+        name: tag_groups
+        required: false
+        schema:
+          nullable: true
+          type: string
         style: form
       - explode: false
         in: header
@@ -2314,8 +2542,12 @@ paths:
           title: Bank Id
           type: string
         style: simple
-      - description: Case-insensitive substring filter on document ID (e.g. 'report'
-          matches 'report-2024')
+      - description: "Case-insensitive substring filter on document ID or document\
+          \ text (e.g. 'report' matches 'report-2024' or any document containing 'report').\
+          \ Meant for browsing and inspection, not for high-volume or latency-sensitive\
+          \ workloads — use recall for that. Matches are capped: past the cap, `total`\
+          \ is a lower bound and `total_is_estimate` is true. A store-owned backend\
+          \ may match approximately; each item's `matched_fields` says what matched."
         explode: true
         in: query
         name: q
@@ -2335,14 +2567,22 @@ paths:
           nullable: true
           type: array
         style: form
-      - description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+      - description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict',\
+          \ 'exact'"
         explode: true
         in: query
         name: tags_match
         required: false
         schema:
           default: any_strict
-          description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+          description: "How to match tags: 'any', 'all', 'any_strict', 'all_strict',\
+            \ 'exact'"
+          enum:
+          - any
+          - all
+          - any_strict
+          - all_strict
+          - exact
           title: Tags Match
           type: string
         style: form
@@ -2647,7 +2887,11 @@ paths:
 
         **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
 
-        The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
+        The new tags are propagated to all associated memory units.
+
+        **Observation scopes** (`observation_scopes`): Replaces how the document's memories are scoped during consolidation, with the same values retain accepts. Use it to move a bank whose documents were retained under per-session tags to `shared` without re-extracting anything. It is also what a later reprocess of the document retains with.
+
+        A memory is re-consolidated only when the change moves the observation scopes it resolves to: its observations are deleted and it is queued again, along with co-source memories from other documents that shared those observations. A change that resolves to the same scopes (a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the current values) keeps every observation and queues nothing.
 
         At least one field must be provided.
       operationId: update_document
@@ -6131,6 +6375,12 @@ components:
         enable_reranking:
           nullable: true
           type: boolean
+        reflect_use_decision_model:
+          nullable: true
+          type: boolean
+        mental_model_refresh_use_decision_model:
+          nullable: true
+          type: boolean
         disposition_skepticism:
           maximum: 5.0
           minimum: 1.0
@@ -6246,6 +6496,9 @@ components:
         enable_auto_consolidation:
           nullable: true
           type: boolean
+        consolidation_use_decision_model:
+          nullable: true
+          type: boolean
         consolidation_max_memories_per_round:
           nullable: true
           type: integer
@@ -6253,6 +6506,9 @@ components:
           nullable: true
           type: integer
         recall_include_chunks:
+          nullable: true
+          type: boolean
+        recall_prefer_observations:
           nullable: true
           type: boolean
         recall_max_tokens:
@@ -6988,8 +7244,8 @@ components:
       properties:
         alias:
           description: "The extra bank id. Same rules as a bank id (non-empty, at\
-            \ most 192 bytes of UTF-8, no control characters), and it must not already\
-            \ name a bank or another alias."
+            \ most 192 bytes of UTF-8, no control characters, no leading underscore),\
+            \ and it must not already name a bank or another alias."
           title: Alias
           type: string
         primary:
@@ -7235,6 +7491,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          full_refresh_cron: full_refresh_cron
           fact_types:
           - world
           - world
@@ -7248,7 +7505,8 @@ components:
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
-          recall_max_tokens: 5
+          budget: low
+          recall_max_tokens: 1
         tags:
         - tags
         - tags
@@ -7644,6 +7902,16 @@ components:
           default: []
           description: Tags associated with this document
           items:
+            type: string
+          type: array
+        matched_fields:
+          default: []
+          description: "Which fields matched the `q` search: 'id', 'original_text',\
+            \ or both. Empty when no `q` is given."
+          items:
+            enum:
+            - id
+            - original_text
             type: string
           type: array
       required:
@@ -8523,6 +8791,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          full_refresh_cron: full_refresh_cron
           fact_types:
           - world
           - world
@@ -8536,7 +8805,8 @@ components:
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
-          recall_max_tokens: 5
+          budget: low
+          recall_max_tokens: 1
         tags:
         - tags
         - tags
@@ -8792,6 +9062,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            full_refresh_cron: full_refresh_cron
             fact_types:
             - world
             - world
@@ -8805,7 +9076,8 @@ components:
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
-            recall_max_tokens: 5
+            budget: low
+            recall_max_tokens: 1
           tags:
           - tags
           - tags
@@ -8840,6 +9112,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            full_refresh_cron: full_refresh_cron
             fact_types:
             - world
             - world
@@ -8853,7 +9126,8 @@ components:
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
-            recall_max_tokens: 5
+            budget: low
+            recall_max_tokens: 1
           tags:
           - tags
           - tags
@@ -9392,6 +9666,12 @@ components:
         offset:
           title: Offset
           type: integer
+        total_is_estimate:
+          default: false
+          description: "True when a `q` search stopped at its match cap, so `total`\
+            \ is a lower bound rather than an exact count. Always false without `q`."
+          title: Total Is Estimate
+          type: boolean
       required:
       - items
       - limit
@@ -10202,6 +10482,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            full_refresh_cron: full_refresh_cron
             fact_types:
             - world
             - world
@@ -10215,7 +10496,8 @@ components:
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
-            recall_max_tokens: 5
+            budget: low
+            recall_max_tokens: 1
           last_refreshed_at: last_refreshed_at
           is_stale: true
           last_memory_seen_at: last_memory_seen_at
@@ -10223,6 +10505,7 @@ components:
           tags:
           - tags
           - tags
+          last_full_refreshed_at: last_full_refreshed_at
           source_query: source_query
           bank_id: bank_id
           reflect_response:
@@ -10250,6 +10533,7 @@ components:
             exclude_mental_models: false
             mode: full
             refresh_after_consolidation: false
+            full_refresh_cron: full_refresh_cron
             fact_types:
             - world
             - world
@@ -10263,7 +10547,8 @@ components:
             tags_match: any
             min_refresh_interval_seconds: 0
             keep_trace: false
-            recall_max_tokens: 5
+            budget: low
+            recall_max_tokens: 1
           last_refreshed_at: last_refreshed_at
           is_stale: true
           last_memory_seen_at: last_memory_seen_at
@@ -10271,6 +10556,7 @@ components:
           tags:
           - tags
           - tags
+          last_full_refreshed_at: last_full_refreshed_at
           source_query: source_query
           bank_id: bank_id
           reflect_response:
@@ -10464,6 +10750,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          full_refresh_cron: full_refresh_cron
           fact_types:
           - world
           - world
@@ -10477,7 +10764,8 @@ components:
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
-          recall_max_tokens: 5
+          budget: low
+          recall_max_tokens: 1
         last_refreshed_at: last_refreshed_at
         is_stale: true
         last_memory_seen_at: last_memory_seen_at
@@ -10485,6 +10773,7 @@ components:
         tags:
         - tags
         - tags
+        last_full_refreshed_at: last_full_refreshed_at
         source_query: source_query
         bank_id: bank_id
         reflect_response:
@@ -10524,6 +10813,9 @@ components:
           nullable: true
           type: string
         last_refresh_failed_at:
+          nullable: true
+          type: string
+        last_full_refreshed_at:
           nullable: true
           type: string
         created_at:
@@ -10622,9 +10914,12 @@ components:
       description: |-
         Trigger settings for a mental model.
 
-        Inherits the reflect options an operator can also default per bank
-        (``reflect_default_options``): set here they apply to this model's refreshes
-        only, and win over the bank default.
+        A refresh is not an ad-hoc reflect with different arguments: it synthesizes a
+        whole document, so it wants its own retrieval and iteration settings. This
+        trigger is therefore the only source for them — a bank's
+        ``reflect_default_options`` deliberately does not reach a refresh. The
+        per-bank default for these fields is ``knowledge_page_default_trigger``,
+        which is merged over this same shape when a page is created.
       example:
         recall_chunks_max_tokens: 5
         refresh_cron: refresh_cron
@@ -10643,6 +10938,7 @@ components:
         exclude_mental_models: false
         mode: full
         refresh_after_consolidation: false
+        full_refresh_cron: full_refresh_cron
         fact_types:
         - world
         - world
@@ -10656,15 +10952,11 @@ components:
         tags_match: any
         min_refresh_interval_seconds: 0
         keep_trace: false
-        recall_max_tokens: 5
+        budget: low
+        recall_max_tokens: 1
       properties:
-        reflect_search_observations_max_tokens:
-          minimum: 1.0
-          nullable: true
-          type: integer
-        reflect_search_observations_include_entities:
-          nullable: true
-          type: boolean
+        budget:
+          $ref: '#/components/schemas/Budget'
         mode:
           default: full
           description: "Refresh mode. 'full' (default) regenerates the mental model\
@@ -10685,6 +10977,9 @@ components:
           title: Refresh After Consolidation
           type: boolean
         refresh_cron:
+          nullable: true
+          type: string
+        full_refresh_cron:
           nullable: true
           type: string
         min_refresh_interval_seconds:
@@ -10734,6 +11029,13 @@ components:
         recall_chunks_max_tokens:
           nullable: true
           type: integer
+        reflect_search_observations_max_tokens:
+          minimum: 1.0
+          nullable: true
+          type: integer
+        reflect_search_observations_include_entities:
+          nullable: true
+          type: boolean
         response_schema:
           additionalProperties: {}
           nullable: true
@@ -10755,9 +11057,12 @@ components:
       description: |-
         Trigger settings for a mental model.
 
-        Inherits the reflect options an operator can also default per bank
-        (``reflect_default_options``): set here they apply to this model's refreshes
-        only, and win over the bank default.
+        A refresh is not an ad-hoc reflect with different arguments: it synthesizes a
+        whole document, so it wants its own retrieval and iteration settings. This
+        trigger is therefore the only source for them — a bank's
+        ``reflect_default_options`` deliberately does not reach a refresh. The
+        per-bank default for these fields is ``knowledge_page_default_trigger``,
+        which is merged over this same shape when a page is created.
       example:
         recall_chunks_max_tokens: 5
         refresh_cron: refresh_cron
@@ -10776,6 +11081,7 @@ components:
         exclude_mental_models: false
         mode: full
         refresh_after_consolidation: false
+        full_refresh_cron: full_refresh_cron
         fact_types:
         - world
         - world
@@ -10789,15 +11095,11 @@ components:
         tags_match: any
         min_refresh_interval_seconds: 0
         keep_trace: false
-        recall_max_tokens: 5
+        budget: low
+        recall_max_tokens: 1
       properties:
-        reflect_search_observations_max_tokens:
-          minimum: 1.0
-          nullable: true
-          type: integer
-        reflect_search_observations_include_entities:
-          nullable: true
-          type: boolean
+        budget:
+          $ref: '#/components/schemas/Budget'
         mode:
           default: full
           description: "Refresh mode. 'full' (default) regenerates the mental model\
@@ -10818,6 +11120,9 @@ components:
           title: Refresh After Consolidation
           type: boolean
         refresh_cron:
+          nullable: true
+          type: string
+        full_refresh_cron:
           nullable: true
           type: string
         min_refresh_interval_seconds:
@@ -10867,6 +11172,13 @@ components:
         recall_chunks_max_tokens:
           nullable: true
           type: integer
+        reflect_search_observations_max_tokens:
+          minimum: 1.0
+          nullable: true
+          type: integer
+        reflect_search_observations_include_entities:
+          nullable: true
+          type: boolean
         response_schema:
           additionalProperties: {}
           nullable: true
@@ -11032,6 +11344,12 @@ components:
         task_type:
           title: Task Type
           type: string
+        operation_id:
+          nullable: true
+          type: string
+        operation_type:
+          nullable: true
+          type: string
         items_count:
           title: Items Count
           type: integer
@@ -11098,6 +11416,15 @@ components:
           title: Status
           type: string
         operation_type:
+          nullable: true
+          type: string
+        id:
+          nullable: true
+          type: string
+        task_type:
+          nullable: true
+          type: string
+        mental_model_id:
           nullable: true
           type: string
         created_at:
@@ -11476,15 +11803,7 @@ components:
           nullable: true
           type: array
         prefer_observations:
-          default: false
-          description: "When recalling raw facts ('world'/'experience') together with\
-            \ 'observation', drop any raw fact that an observation in the results\
-            \ was consolidated from, so the observation supersedes it and you don't\
-            \ get duplicate content. The freed slots are backfilled with the next\
-            \ results, keeping the result count at the requested budget. Disabled\
-            \ by default; set to true to enable. No effect unless 'observation' and\
-            \ at least one raw type are both requested."
-          title: Prefer Observations
+          nullable: true
           type: boolean
         budget:
           $ref: '#/components/schemas/Budget'
@@ -12110,6 +12429,17 @@ components:
       required:
       - outcome
       title: RefreshMentalModelOperationDetails
+    RefreshMentalModelRequest:
+      description: "Optional body of POST /mental-models/{id}/refresh."
+      example:
+        mode: full
+      properties:
+        mode:
+          enum:
+          - full
+          nullable: true
+          type: string
+      title: RefreshMentalModelRequest
     ReprocessDocumentResponse:
       description: Response model for reprocess document endpoint.
       example:
@@ -12672,6 +13002,8 @@ components:
             type: string
           nullable: true
           type: array
+        observation_scopes:
+          $ref: '#/components/schemas/UpdateDocumentObservationScopes'
       title: UpdateDocumentRequest
     UpdateDocumentResponse:
       description: Response model for update document endpoint.
@@ -12793,6 +13125,7 @@ components:
           exclude_mental_models: false
           mode: full
           refresh_after_consolidation: false
+          full_refresh_cron: full_refresh_cron
           fact_types:
           - world
           - world
@@ -12806,7 +13139,8 @@ components:
           tags_match: any
           min_refresh_interval_seconds: 0
           keep_trace: false
-          recall_max_tokens: 5
+          budget: low
+          recall_max_tokens: 1
         tags:
         - tags
         - tags
@@ -12932,6 +13266,7 @@ components:
           created_at: created_at
           last_response_status: 6
           url: url
+          event_id: event_id
           event_type: event_type
           updated_at: updated_at
           webhook_id: webhook_id
@@ -12945,6 +13280,7 @@ components:
           created_at: created_at
           last_response_status: 6
           url: url
+          event_id: event_id
           event_type: event_type
           updated_at: updated_at
           webhook_id: webhook_id
@@ -12972,6 +13308,7 @@ components:
         created_at: created_at
         last_response_status: 6
         url: url
+        event_id: event_id
         event_type: event_type
         updated_at: updated_at
         webhook_id: webhook_id
@@ -12983,6 +13320,9 @@ components:
       properties:
         id:
           title: Id
+          type: string
+        event_id:
+          nullable: true
           type: string
         webhook_id:
           nullable: true
@@ -13263,6 +13603,28 @@ components:
       - $ref: '#/components/schemas/TagGroupOr-Output'
       - $ref: '#/components/schemas/TagGroupNot-Output'
       title: Not
+    UpdateDocumentObservationScopes:
+      anyOf:
+      - enum:
+        - per_tag
+        - combined
+        - all_combinations
+        - shared
+        type: string
+      - items:
+          items:
+            type: string
+          type: array
+        type: array
+      description: "New observation scoping for the document's memories, with the\
+        \ same values retain accepts (send 'combined' to return to the default). Use\
+        \ it to move memories retained under one scoping to another — e.g. per-session\
+        \ documents to 'shared' — without re-extracting them. Memories whose resolved\
+        \ scopes change lose their observations and are re-consolidated; the rest\
+        \ keep theirs. Also becomes the scoping a later reprocess of the document\
+        \ uses."
+      nullable: true
+      title: UpdateDocumentObservationScopes
     ValidationError_loc_inner:
       anyOf:
       - type: string

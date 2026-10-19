@@ -7,7 +7,7 @@ Track and manage document sources in your memory bank. Documents provide traceab
 
 > **💡 Prerequisites**
 >
-Make sure you've completed the [Quick Start](./quickstart) and understand [how retain works](./retain).
+Make sure you've completed the [Quick Start](./quickstart.md) and understand [how retain works](./retain.md).
 ## What Are Documents?
 
 Documents are containers for retained content. They help you:
@@ -27,7 +27,7 @@ When you retain content, Hindsight splits it into chunks before extracting facts
 
 > **💡 Include Chunks in Recall**
 >
-Use `include_chunks=True` in your recall calls to get the original text chunks alongside fact results. See [Recall](./recall) for details.
+Use `include_chunks=True` in your recall calls to get the original text chunks alongside fact results. See [Recall](./recall.md) for details.
 ## Retain with Document ID
 
 Associate retained content with a document:
@@ -500,10 +500,14 @@ for _, d := range docs.Items {
 
 | Parameter | Description |
 |---|---|
-| `q` | Case-insensitive substring match on document ID. `report` matches `report-2024`, `annual-report`, etc. |
+| `q` | Case-insensitive substring match on document ID or document text. `report` matches `report-2024`, `annual-report`, or any document whose text contains `report`. Not indexed: meant for browsing and inspecting a bank, not for high-volume or latency-sensitive lookups (use recall for those). |
 | `tags` | Filter by document tags. Accepts multiple values. |
 | `tags_match` | How to match tags (default: `any_strict`). See below. |
 | `limit` / `offset` | Pagination. Default limit is 100. |
+
+When `q` is set, each returned row carries `matched_fields`: `["id"]`, `["original_text"]`, or both, so a caller can tell why a document matched.
+
+A `q` search counts at most 1,000 matches. Past that, `total` is a lower bound, `total_is_estimate` is `true`, and pages stop at the cap. Narrow the search, or add a tag or time filter, to reach the rest. Some storage backends match `q` approximately — `matched_fields` always says what matched.
 
 **`tags_match` modes:**
 
@@ -535,5 +539,5 @@ for _, d := range docs.Items {
 
 ## Next Steps
 
-- [**Operations**](./operations) — Monitor background tasks
-- [**Memory Banks**](./memory-banks) — Configure bank settings
+- [**Operations**](./operations.md) — Monitor background tasks
+- [**Memory Banks**](./memory-banks.md) — Configure bank settings

@@ -6,14 +6,14 @@ import CodeSnippet from '@site/src/components/CodeSnippet';
 import recallPy from '!!raw-loader!@site/examples/api/recall.py';
 import memoryBanksPy from '!!raw-loader!@site/examples/api/memory-banks.py';
 import observationsPy from '!!raw-loader!@site/examples/api/observations.py';
-import {Flow} from '@vectorize-io/interfig';
-import observationsFigure from '@vectorize-io/interfig/figures/observations';
+import Figure from '@site/src/components/Figure';
+import observationsFigure from '@site/figures/observations.json';
 
 # Observations: Knowledge Consolidation
 
 After memories are retained, Hindsight automatically consolidates related facts into **observations** — deduplicated, evidence-grounded beliefs the bank has built up from multiple memories. Each observation tracks its supporting evidence (with exact quotes) and a proof count, and is refined rather than overwritten when new evidence arrives.
 
-<Flow {...observationsFigure.props} />
+<Figure doc={observationsFigure} />
 
 ---
 
@@ -162,6 +162,19 @@ See [`observation_scopes` in the Retain API](./api/retain#observation_scopes) fo
 
 To inspect the scopes that already exist in a bank, call `GET /v1/default/banks/{bank_id}/observations/scopes`. The response lists each exact tag set with its observation count; the empty tag list is the global scope. The listing is paged (`limit`, default 100, and `offset`), with `total` reporting how many distinct scopes the bank holds. Use a returned scope as `tags` with `tags_match: "exact"` when you need to filter to that precise observation scope without also matching observations that carry extra tags. To recall **only** the global scope — the untagged observations written by `observation_scopes: "shared"` — pass an empty list with exact matching: `tags: []`, `tags_match: "exact"`.
 
+### Changing the Scopes of Existing Documents {#changing-scopes}
+
+The scoping is stored on each memory when it is retained. To move documents that are already in the bank, for example a bank retained with per-session tags under the default `combined` scoping that should now consolidate across sessions, send the new value on the document:
+
+<CodeSnippet code={observationsPy} section="change-document-scopes" language="python" />
+
+It takes the same values as retain (`"combined"` returns to the default). Nothing is re-extracted, and the memories keep their tags. A memory is consolidated again only if the change moves the scopes it resolves to. In that case its observations are deleted and rebuilt in the new scope by the next consolidation, and so are observations that other documents' memories shared with it. A change that resolves to the same scopes deletes nothing and queues nothing. Examples: `combined` over a single tag versus `[["that-tag"]]`, or re-sending the current value. The new value is also saved on the document, so a later reprocess keeps it.
+
+To move a whole bank, list its documents (filtering by tag if needed) and send one PATCH per document. Two things to know first:
+
+- **Update the client first.** A retain that appends to a document sends its own `observation_scopes`. If your client still retains without the new value, the next append moves that document back.
+- **Expect a rebuild.** Every moved memory loses its observations until consolidation runs again. On a large bank that is one LLM pass over most of its facts, and recall returns fewer observations meanwhile. Mental models citing the deleted observations refresh as usual. Moving documents in batches spreads the cost.
+
 ---
 
 ## Observations Mission
@@ -223,6 +236,13 @@ How a strategy is matched:
 
   Because the mode is per alternative, one strategy can mix them — `[{"tags": ["company:*"], "tags_match": "exact"}, {"tags": ["team:*"]}]` claims scopes that are *only* a company, or that have a team among other tags. To match *any one* of several tags, give each its own alternative: `[{"tags": ["company:*"]}, {"tags": ["team:*"]}]`. Excluding a tag ("has a company but no user") is not expressible.
 
+  :::caution The untagged scope can never be claimed
+  No pattern matches a scope with no tags, including a bare `["*"]`. That means a bank using
+  [`observation_scopes: "shared"`](./api/retain#observation_scopes), which consolidates over the single untagged
+  scope, has one scope that no strategy can reach: it always uses the bank-wide values. If you need a
+  differently-briefed catch-all, give it a real tag and target that instead of relying on `shared`.
+  :::
+
   Remember that a strategy matches **observation scopes** — the tag sets consolidation groups observations under, set by [`observation_scopes`](./api/retain#observation_scopes) at retain time — not the tags of individual memories. A memory tagged with a user, a team and a company but retained with `observation_scopes: [["user:dana"], ["team:exec"], ["company:acme"]]` produces three single-tag scopes, none of which has both a company and a team.
 - **What a strategy can set:** `observations_mission`, `max_observations_per_scope`, `consolidation_source_facts_max_tokens` and `consolidation_source_facts_max_tokens_per_observation`. Every one is optional.
 - **Anything a strategy leaves unset, and every scope no strategy matches,** uses the bank-wide value. The control plane shows these bank-wide values as the **Default** strategy.
@@ -246,11 +266,25 @@ To see which strategy a scope uses, open the strategy in the control plane: each
 
 A strategy that sets nothing is ignored: it matches no scope and doesn't block later ones.
 
-A malformed strategy is rejected when you save it — an unknown key (`"scope"` for `"scopes"`), a tag list that is not a list of strings, an unknown `tags_match` — with a 400 naming the offending entry. An *incomplete* one is accepted, because the control plane saves strategies as you type them: a rule with no tags yet, or a strategy with no setting yet, is stored and simply ignored until you finish it. Strategies survive [bank template](/developer/api/memory-banks) export and import unchanged.
+A malformed strategy is rejected when you save it through the control plane or the bank config API — an unknown key
+(`"scope"` for `"scopes"`), a tag list that is not a list of strings, an unknown `tags_match` — with a 400 naming the
+offending entry. The `HINDSIGHT_API_CONSOLIDATION_STRATEGIES` environment variable is **not** validated this way: a
+malformed entry is dropped silently, and an unrecognised `tags_match` falls back to `"all"` rather than erroring. If you
+configure strategies by environment variable, check the preview afterwards to confirm each one claims what you expect. An *incomplete* one is accepted, because the control plane saves strategies as you type them: a rule with no tags yet, or a strategy with no setting yet, is stored and simply ignored until you finish it. Strategies survive [bank template](/developer/api/memory-banks) export and import unchanged.
 
 Each scope is consolidated in its own LLM call, so one scope's mission never reaches another scope's call.
 
-Set `consolidation_strategies` in the control plane (bank **Configuration → Observations**), via the [bank config API](/developer/api/memory-banks#observations-configuration), or with the [`HINDSIGHT_API_CONSOLIDATION_STRATEGIES`](/developer/configuration#observations) environment variable. It replaces the older `observation_scope_limits`, which still works but is checked only after the strategies.
+Set `consolidation_strategies` in the control plane (bank **Configuration → Observations**), via the [bank config API](/developer/api/memory-banks#observations-configuration), or with the [`HINDSIGHT_API_CONSOLIDATION_STRATEGIES`](/developer/configuration#observations) environment variable. It replaces the older `observation_scope_limits`, which still works but is checked only after the strategies, and only
+ever carried the observation cap.
+
+:::note Porting a rule from `observation_scope_limits`
+The two fields match differently. `observation_scope_limits` is exact-cover only: its pattern must account for every tag
+in the scope. A strategy defaults to `tags_match: "all"`, which allows extra tags. Copying a pattern across unchanged
+therefore widens what it matches. Add `"tags_match": "exact"` to keep the old behaviour.
+
+Note also that a strategy claiming a scope without setting `max_observations_per_scope` leaves the cap to
+`observation_scope_limits`, falling back past any later strategy that would have set one.
+:::
 
 ---
 

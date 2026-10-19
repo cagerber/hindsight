@@ -5,7 +5,9 @@
 
 import { toast } from "sonner";
 import { bankApi, bankStatsApi, chunkApi, documentApi, memoryApi } from "./bank-url";
+import { SESSION_REQUIRED_HEADER } from "./auth/session";
 import { stripBasePath, withBasePath } from "./base-path";
+import { appendTagFilter, type TagFilter, type TagsMatch } from "./tag-filter-params";
 
 /**
  * Reduce an API error `details` value to a string safe to render in a toast.
@@ -90,6 +92,7 @@ export interface Webhook {
 
 export interface WebhookDelivery {
   id: string;
+  event_id: string | null;
   webhook_id: string | null;
   url: string;
   event_type: string;
@@ -211,7 +214,18 @@ export interface OperationProgress {
   detail?: Record<string, number> | null;
 }
 
-export type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
+export type { TagsMatch };
+
+/** Tag filter for the knowledge-base tree and search (recall's tags / tags_match). */
+export type KnowledgeTagFilter = TagFilter;
+
+/** `&tags=..&tags_match=..`, or "" when the filter is empty. */
+function knowledgeTagQuery(filter?: KnowledgeTagFilter): string {
+  const params = new URLSearchParams();
+  if (filter) appendTagFilter(params, filter);
+  const qs = params.toString();
+  return qs ? `&${qs}` : "";
+}
 
 // Time axes the two list endpoints can filter and order by. The chosen axis does
 // both, and rows with no value on it are excluded — see the dataplane's
@@ -244,6 +258,7 @@ export interface MentalModel {
     mode?: "full" | "delta";
     refresh_after_consolidation: boolean;
     refresh_cron?: string | null;
+    full_refresh_cron?: string | null;
     min_refresh_interval_seconds?: number | null;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
@@ -253,6 +268,7 @@ export interface MentalModel {
     include_chunks?: boolean;
     recall_max_tokens?: number;
     recall_chunks_max_tokens?: number;
+    budget?: "low" | "mid" | "high";
     reflect_search_observations_max_tokens?: number;
     reflect_search_observations_include_entities?: boolean;
     response_schema?: Record<string, unknown>;
@@ -266,6 +282,8 @@ export interface MentalModel {
   is_stale?: boolean | null;
   /** When the last refresh failed. Set = automatic refreshes are paused for this model. */
   last_refresh_failed_at?: string | null;
+  /** When a refresh last ran in full mode. `trigger.full_refresh_cron` comes due against this. */
+  last_full_refreshed_at?: string | null;
 }
 
 /** How a refresh resolved full-vs-delta, and why it did not stay in delta. */
@@ -413,9 +431,14 @@ export class ControlPlaneClient {
 
       if (!response.ok) {
         const isClientError = response.status >= 400 && response.status < 500;
-        // Redirect to login on 401 (session expired or not authenticated)
+        // Redirect to login only when the UI session itself was refused. A 401 the
+        // dataplane returned is shown as an error: a new UI key can't fix it.
         const currentPath = stripBasePath(`${window.location.pathname}${window.location.search}`);
-        if (response.status === 401 && !currentPath.startsWith("/login")) {
+        if (
+          response.status === 401 &&
+          response.headers.get(SESSION_REQUIRED_HEADER) &&
+          !currentPath.startsWith("/login")
+        ) {
           window.location.href = withBasePath(`/login?returnTo=${encodeURIComponent(currentPath)}`);
           throw new Error("Unauthorized");
         }
@@ -482,8 +505,10 @@ export class ControlPlaneClient {
 
       return response.json();
     } catch (error) {
-      // If it's not a response error (network error, etc.), show toast
-      if (!(error as any).status && !suppressErrorToast) {
+      // If it's not a response error (network error, etc.), show toast. A request
+      // the caller cancelled is not an error worth telling anyone about.
+      const aborted = (error as any)?.name === "AbortError";
+      if (!(error as any).status && !suppressErrorToast && !aborted) {
         toast.error("Network Error", {
           description: error instanceof Error ? error.message : "Failed to connect to server",
           duration: 5000,
@@ -645,6 +670,7 @@ export class ControlPlaneClient {
       document_id?: string;
       metadata?: Record<string, string>;
       entities?: Array<{ text: string; type?: string }>;
+      resolve_entities?: boolean;
       tags?: string[];
       observation_scopes?: "per_tag" | "combined" | "all_combinations" | "shared" | string[][];
       strategy?: string;
@@ -693,16 +719,19 @@ export class ControlPlaneClient {
   /**
    * Get graph data
    */
-  async getGraph(params: {
-    bank_id: string;
-    type?: string;
-    limit?: number;
-    q?: string;
-    tags?: string[];
-    tags_match?: string;
-    document_id?: string;
-    chunk_id?: string;
-  }) {
+  async getGraph(
+    params: {
+      bank_id: string;
+      type?: string;
+      limit?: number;
+      q?: string;
+      tags?: string[];
+      tags_match?: string;
+      document_id?: string;
+      chunk_id?: string;
+    },
+    signal?: AbortSignal
+  ) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.type) queryParams.append("type", params.type);
@@ -717,7 +746,7 @@ export class ControlPlaneClient {
     if (params.tags_match) queryParams.append("tags_match", params.tags_match);
     if (params.document_id) queryParams.append("document_id", params.document_id);
     if (params.chunk_id) queryParams.append("chunk_id", params.chunk_id);
-    return this.fetchApi(`/api/graph?${queryParams}`);
+    return this.fetchApi(`/api/graph?${queryParams}`, { signal });
   }
 
   /**
@@ -811,11 +840,19 @@ export class ControlPlaneClient {
   /**
    * List entities
    */
-  async listEntities(params: { bank_id: string; limit?: number; offset?: number }) {
+  async listEntities(params: {
+    bank_id: string;
+    limit?: number;
+    offset?: number;
+    /** Only count memories carrying these tags; entities no matching memory mentions are left out. */
+    tags?: string[];
+    tags_match?: TagsMatch;
+  }) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.limit) queryParams.append("limit", params.limit.toString());
     if (params.offset) queryParams.append("offset", params.offset.toString());
+    appendTagFilter(queryParams, params);
     return this.fetchApi<{
       items: any[];
       total: number;
@@ -827,12 +864,20 @@ export class ControlPlaneClient {
   /**
    * Get entity co-occurrence graph
    */
-  async getEntityGraph(params: { bank_id: string; limit?: number; min_count?: number }) {
+  async getEntityGraph(params: {
+    bank_id: string;
+    limit?: number;
+    min_count?: number;
+    /** Build the graph from the memories carrying these tags only. */
+    tags?: string[];
+    tags_match?: TagsMatch;
+  }) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.limit) queryParams.append("limit", params.limit.toString());
     if (params.min_count !== undefined)
       queryParams.append("min_count", params.min_count.toString());
+    appendTagFilter(queryParams, params);
     return this.fetchApi<{
       nodes: Array<{ data: { id: string; label: string; mentionCount: number; color: string } }>;
       edges: Array<{
@@ -856,16 +901,16 @@ export class ControlPlaneClient {
   /**
    * Get the knowledge base as a nested folder/page tree.
    */
-  async getKnowledgeTree(bankId: string) {
+  async getKnowledgeTree(bankId: string, filter?: KnowledgeTagFilter) {
     return this.fetchApi<{ roots: KnowledgeNode[] }>(
-      `/api/knowledge-base/tree?bank_id=${encodeURIComponent(bankId)}`
+      `/api/knowledge-base/tree?bank_id=${encodeURIComponent(bankId)}${knowledgeTagQuery(filter)}`
     );
   }
 
   /**
    * Hybrid search (BM25 + vector) across a bank's knowledge pages.
    */
-  async searchKnowledgePages(bankId: string, q: string, limit = 10) {
+  async searchKnowledgePages(bankId: string, q: string, limit = 10, filter?: KnowledgeTagFilter) {
     return this.fetchApi<{
       results: Array<{
         id: string;
@@ -877,7 +922,7 @@ export class ControlPlaneClient {
       }>;
       total: number;
     }>(
-      `/api/knowledge-base/search?bank_id=${encodeURIComponent(bankId)}&q=${encodeURIComponent(q)}&limit=${limit}`
+      `/api/knowledge-base/search?bank_id=${encodeURIComponent(bankId)}&q=${encodeURIComponent(q)}&limit=${limit}${knowledgeTagQuery(filter)}`
     );
   }
 
@@ -951,6 +996,7 @@ export class ControlPlaneClient {
         mode?: "full" | "delta";
         refresh_after_consolidation?: boolean;
         refresh_cron?: string | null;
+        full_refresh_cron?: string | null;
         min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
@@ -986,10 +1032,15 @@ export class ControlPlaneClient {
   /**
    * Get entity details
    */
-  async getEntity(entityId: string, bankId: string) {
-    return this.fetchApi(
-      `/api/entities/${encodeURIComponent(entityId)}?bank_id=${encodeURIComponent(bankId)}`
-    );
+  async getEntity(
+    entityId: string,
+    bankId: string,
+    filter: { tags?: string[]; tags_match?: TagsMatch } = {}
+  ) {
+    const queryParams = new URLSearchParams();
+    queryParams.append("bank_id", bankId);
+    appendTagFilter(queryParams, filter);
+    return this.fetchApi(`/api/entities/${encodeURIComponent(entityId)}?${queryParams}`);
   }
 
   /**
@@ -1034,11 +1085,18 @@ export class ControlPlaneClient {
   /**
    * Update tags on a document and its associated memory units
    */
-  async updateDocument(documentId: string, bankId: string, tags: string[]) {
+  async updateDocument(
+    documentId: string,
+    bankId: string,
+    update: {
+      tags?: string[];
+      observation_scopes?: "per_tag" | "combined" | "all_combinations" | "shared" | string[][];
+    }
+  ) {
     return this.fetchApi<{ success: boolean }>(documentApi(documentId, bankId), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tags }),
+      body: JSON.stringify(update),
     });
   }
 
@@ -1171,11 +1229,14 @@ export class ControlPlaneClient {
       startDate?: string;
       /** ISO-8601, exclusive. */
       endDate?: string;
+      tags?: string[];
+      tagsMatch?: TagsMatch;
       limit?: number;
       offset?: number;
     }
   ) {
     const params = new URLSearchParams({ bank_id: bankId });
+    appendTagFilter(params, { tags: options?.tags, tags_match: options?.tagsMatch });
     if (options?.type) params.set("type", options.type);
     if (options?.q) params.set("q", options.q);
     if (options?.consolidationState) params.set("consolidation_state", options.consolidationState);
@@ -1723,6 +1784,7 @@ export class ControlPlaneClient {
           mode?: "full" | "delta";
           refresh_after_consolidation: boolean;
           refresh_cron?: string | null;
+          full_refresh_cron?: string | null;
           min_refresh_interval_seconds?: number | null;
           fact_types?: Array<"world" | "experience" | "observation">;
           exclude_mental_models?: boolean;
@@ -1732,6 +1794,7 @@ export class ControlPlaneClient {
           include_chunks?: boolean;
           recall_max_tokens?: number;
           recall_chunks_max_tokens?: number;
+          budget?: "low" | "mid" | "high";
           reflect_search_observations_max_tokens?: number;
           reflect_search_observations_include_entities?: boolean;
           response_schema?: Record<string, unknown>;
@@ -1792,6 +1855,7 @@ export class ControlPlaneClient {
         mode?: "full" | "delta";
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        full_refresh_cron?: string | null;
         min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation"> | null;
         exclude_mental_models?: boolean;
@@ -1801,6 +1865,7 @@ export class ControlPlaneClient {
         include_chunks?: boolean;
         recall_max_tokens?: number;
         recall_chunks_max_tokens?: number;
+        budget?: "low" | "mid" | "high";
         reflect_search_observations_max_tokens?: number;
         reflect_search_observations_include_entities?: boolean;
         response_schema?: Record<string, unknown>;
@@ -1840,6 +1905,7 @@ export class ControlPlaneClient {
         mode?: "full" | "delta";
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        full_refresh_cron?: string | null;
         min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation"> | null;
         exclude_mental_models?: boolean;
@@ -1849,6 +1915,7 @@ export class ControlPlaneClient {
         include_chunks?: boolean;
         recall_max_tokens?: number;
         recall_chunks_max_tokens?: number;
+        budget?: "low" | "mid" | "high";
         reflect_search_observations_max_tokens?: number;
         reflect_search_observations_include_entities?: boolean;
         response_schema?: Record<string, unknown>;
@@ -1867,6 +1934,7 @@ export class ControlPlaneClient {
       trigger: {
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        full_refresh_cron?: string | null;
         min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
@@ -1876,6 +1944,7 @@ export class ControlPlaneClient {
         include_chunks?: boolean;
         recall_max_tokens?: number;
         recall_chunks_max_tokens?: number;
+        budget?: "low" | "mid" | "high";
         reflect_search_observations_max_tokens?: number;
         reflect_search_observations_include_entities?: boolean;
         response_schema?: Record<string, unknown>;
@@ -1906,11 +1975,13 @@ export class ControlPlaneClient {
   /**
    * Refresh a mental model (re-run source query) - async operation
    */
-  async refreshMentalModel(bankId: string, mentalModelId: string) {
+  async refreshMentalModel(bankId: string, mentalModelId: string, options?: { mode?: "full" }) {
     return this.fetchApi<{
       operation_id: string;
     }>(bankApi(bankId, `/mental-models/${encodeURIComponent(mentalModelId)}/refresh`), {
       method: "POST",
+      // "full" rewrites the document from scratch this once; the model keeps its mode.
+      ...(options?.mode ? { body: JSON.stringify({ mode: options.mode }) } : {}),
     });
   }
 

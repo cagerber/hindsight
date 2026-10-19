@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import pathlib
-import re
 import shutil
 import tempfile
 import threading
@@ -37,6 +36,7 @@ from hindsight_api.engine.llm_interface import (
     ProviderContentPolicyError,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
+from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences
 from hindsight_api.engine.response_models import (
     LLMCallResult,
     LLMToolCall,
@@ -233,20 +233,10 @@ def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
 
 def _extract_json(text: str) -> Any:
     """Parse JSON out of a free-form reply, tolerating markdown fences and prose."""
-    candidate = text.strip()
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", candidate, re.DOTALL)
-    if fenced:
-        candidate = fenced.group(1).strip()
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        # A chatty model wraps the object in a sentence; take the outermost
-        # brace/bracket span rather than failing the whole call over prose.
-        start = min((i for i in (candidate.find("{"), candidate.find("[")) if i != -1), default=-1)
-        end = max(candidate.rfind("}"), candidate.rfind("]"))
-        if start == -1 or end <= start:
-            raise
-        return json.loads(candidate[start : end + 1])
+    # The shared helper finds fences by line and falls back to the outermost JSON
+    # span. The non-greedy ```(.*?)``` regex used here before cut the payload at a
+    # ``` inside a JSON string value (#4819).
+    return json.loads(_strip_code_fences(text.strip()))
 
 
 class CursorLLM(LLMInterface):
@@ -344,8 +334,17 @@ class CursorLLM(LLMInterface):
             output_tokens=result.usage.output_tokens,
         )
 
-    def _record(self, scope: str, start: float, input_tokens: int, output_tokens: int) -> None:
-        duration = time.time() - start
+    def _record(
+        self,
+        scope: str,
+        start: float,
+        messages: list[dict[str, Any]],
+        result: Any,
+        input_tokens: int,
+        output_tokens: int,
+        tool_calls: list[LLMToolCall] | None = None,
+    ) -> None:
+        duration = time.perf_counter() - start
         get_metrics_collector().record_llm_call(
             provider=self.provider,
             model=self.model,
@@ -355,6 +354,26 @@ class CursorLLM(LLMInterface):
             output_tokens=output_tokens,
             success=True,
         )
+        # The wrapper records spans only for failed calls; a successful one is the
+        # provider's to record, or it never reaches the traces (#5381).
+        try:
+            from hindsight_api.tracing import _serialize_for_span, get_span_recorder
+
+            get_span_recorder().record_llm_call(
+                provider=self.provider,
+                model=self.model,
+                scope=scope,
+                messages=messages,
+                response_content=_serialize_for_span(result),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration=duration,
+                finish_reason="tool_calls" if tool_calls else "stop",
+                error=None,
+                tool_calls=[{"id": c.id, "name": c.name, "arguments": c.arguments} for c in tool_calls or []] or None,
+            )
+        except Exception:
+            logger.debug("Cursor span recording failed", exc_info=True)
         if duration > 10.0:
             logger.info(f"slow llm call: scope={scope}, model={self.provider}/{self.model}, time={duration:.3f}s")
 
@@ -379,7 +398,7 @@ class CursorLLM(LLMInterface):
         strict_schema: bool = False,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMCallResult:
-        start = time.time()
+        start = time.perf_counter()
         prompt = _messages_to_prompt(messages)
         if response_format is not None and hasattr(response_format, "model_json_schema"):
             schema = provider_json_schema(response_format)
@@ -413,7 +432,7 @@ class CursorLLM(LLMInterface):
                         raise
                     result = data if skip_validation else response_format.model_validate(data)
 
-                self._record(scope, start, in_tok, out_tok)
+                self._record(scope, start, messages, result, in_tok, out_tok)
                 return LLMCallResult(
                     content=result,
                     usage=TokenUsage(input_tokens=in_tok, output_tokens=out_tok, total_tokens=in_tok + out_tok),
@@ -457,7 +476,7 @@ class CursorLLM(LLMInterface):
         and ``codex_llm.py`` use is unavailable. Describing the tools in the
         prompt and parsing the model's chosen call out of JSON is what is left.
         """
-        start = time.time()
+        start = time.perf_counter()
         prompt = _messages_to_prompt(messages)
 
         if tool_choice.mode is LLMToolChoiceMode.NONE or not tools:
@@ -535,7 +554,7 @@ class CursorLLM(LLMInterface):
                             )
                         )
 
-                self._record(scope, start, in_tok, out_tok)
+                self._record(scope, start, messages, content, in_tok, out_tok, tool_calls)
                 return LLMToolCallResult(
                     content=content,
                     tool_calls=tool_calls,

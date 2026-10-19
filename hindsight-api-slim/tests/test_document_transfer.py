@@ -24,7 +24,10 @@ from hindsight_api.engine.consolidation.consolidator import (
     _embed_observation_text,
 )
 from hindsight_api.engine.db_utils import acquire_with_retry
-from hindsight_api.engine.schema import fq_table
+from hindsight_api.engine.memories.base import MemoriesExtension
+from hindsight_api.engine.memories.postgres import PostgresMemories
+from hindsight_api.engine.retain import bank_utils
+from hindsight_api.engine.schema import fq_store_table
 from hindsight_api.engine.storage import bank_storage_prefix
 from hindsight_api.engine.transfer import import_documents
 from hindsight_api.engine.transfer.importer import _EMBED_BATCH_SIZE, _embed_in_batches, parse_archive
@@ -39,37 +42,16 @@ from hindsight_api.engine.transfer.schema import (
     TransferObservationSource,
 )
 from hindsight_api.extensions import (
-    OperationValidatorExtension,
-    RecallContext,
-    ReflectContext,
-    RetainContext,
-    RetainResult,
+    BankWriteContext,
+    BankWriteOperation,
+    ImportArchiveDocument,
+    ImportContext,
+    OperationValidationError,
+    RetainSource,
     ValidationResult,
 )
 from hindsight_api.webhooks.manager import WebhookManager
-
-
-class _RetainResultCapture(OperationValidatorExtension):
-    """Records each RetainResult the engine reports via on_retain_complete.
-
-    The pre-operation validators are required by the abstract base; they always
-    accept so they don't interfere with the operations under test.
-    """
-
-    def __init__(self) -> None:
-        self.results: list[RetainResult] = []
-
-    async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
-        return ValidationResult.accept()
-
-    async def on_retain_complete(self, result: RetainResult) -> None:
-        self.results.append(result)
+from tests.retain_result_capture import RetainResultCapture
 
 
 async def _seed_observation(*, pool, memory, bank_id, source_memory_ids, observation_text):
@@ -206,14 +188,14 @@ async def test_import_filters_degenerate_fact_without_shifting_archive_ordinals(
         async with acquire_with_retry(backend) as conn:
             units = await conn.fetch(
                 f"SELECT id, text, chunk_id, fact_type, source_memory_ids "
-                f"FROM {fq_table('memory_units')} WHERE bank_id = $1",
+                f"FROM {fq_store_table('memory_units')} WHERE bank_id = $1",
                 dst,
             )
             causal_links = await conn.fetch(
                 f"SELECT ml.link_type, source.text AS source_text, target.text AS target_text "
-                f"FROM {fq_table('memory_links')} ml "
-                f"JOIN {fq_table('memory_units')} source ON source.id = ml.from_unit_id "
-                f"JOIN {fq_table('memory_units')} target ON target.id = ml.to_unit_id "
+                f"FROM {fq_store_table('memory_links')} ml "
+                f"JOIN {fq_store_table('memory_units')} source ON source.id = ml.from_unit_id "
+                f"JOIN {fq_store_table('memory_units')} target ON target.id = ml.to_unit_id "
                 f"WHERE ml.bank_id = $1 AND ml.link_type = ANY($2)",
                 dst,
                 ["caused_by", "causes", "prevents"],
@@ -230,6 +212,70 @@ async def test_import_filters_degenerate_fact_without_shifting_archive_ordinals(
         assert {(row["link_type"], row["source_text"], row["target_text"]) for row in causal_links} == {
             ("caused_by", later_text, middle_text),
             ("causes", later_text, middle_text),
+        }
+    finally:
+        await memory.delete_bank(dst, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_documents_written_in_one_batch_keep_their_own_facts_chunks_and_causal_links(memory, request_context):
+    """Several documents share one write; each fact must still land on its own document.
+
+    A causal target is an ordinal within its document, so in a shared write it has to be shifted
+    to the batch position — unshifted, the second document's effect would point at the first
+    document's cause.
+    """
+    dst = _unique_bank("transfer_batched_docs")
+    documents = [
+        TransferDocument(
+            id=f"doc-{d}",
+            original_text=f"Batched document {d}.",
+            chunks=[TransferChunk(chunk_index=0, chunk_text=f"chunk of doc {d}")],
+            facts=[
+                TransferFact(text=f"Batched doc {d} cause event", fact_type="world", chunk_index=0),
+                TransferFact(
+                    text=f"Batched doc {d} effect event",
+                    fact_type="world",
+                    chunk_index=0,
+                    causal_relations=[TransferCausalRelation(relation_type="caused_by", target_fact_index=0)],
+                ),
+            ],
+        )
+        for d in range(3)
+    ]
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("manifest.json", TransferManifest(source_bank_id="source", document_count=3).model_dump_json())
+        for d, document in enumerate(documents):
+            archive.writestr(f"documents/{d:06d}.json", document.model_dump_json())
+
+    try:
+        result = await _import(memory, dst, archive_buffer.getvalue(), request_context)
+        assert result["documents_imported"] == 3
+        assert result["facts_imported"] == 6
+
+        units = await memory.list_memory_units(dst, fact_type="world", limit=100, request_context=request_context)
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            # Raw memory_links: the link's direction and type are the assertion, and the
+            # graph read path dedupes bidirectional edges.
+            causal_links = await conn.fetch(
+                f"SELECT source.text AS source_text, target.text AS target_text "
+                f"FROM {fq_store_table('memory_links')} ml "
+                f"JOIN {fq_store_table('memory_units')} source ON source.id = ml.from_unit_id "
+                f"JOIN {fq_store_table('memory_units')} target ON target.id = ml.to_unit_id "
+                f"WHERE ml.bank_id = $1 AND ml.link_type = 'caused_by'",
+                dst,
+            )
+
+        assert {(u["text"], u["document_id"], u["chunk_id"]) for u in units["items"]} == {
+            (f"Batched doc {d} {kind} event", f"doc-{d}", build_chunk_id(dst, f"doc-{d}", 0))
+            for d in range(3)
+            for kind in ("cause", "effect")
+        }
+        assert {(row["source_text"], row["target_text"]) for row in causal_links} == {
+            (f"Batched doc {d} effect event", f"Batched doc {d} cause event") for d in range(3)
         }
     finally:
         await memory.delete_bank(dst, request_context=request_context)
@@ -387,11 +433,11 @@ async def test_restore_rows_normalizes_jsonb_strings(memory):
                 bank_rows_json_encoding="serialized",
             )
             decoded_row = await conn.fetchrow(
-                f"SELECT input::text, output::text, llm_info::text FROM {fq_table('llm_requests')} WHERE id = $1",
+                f"SELECT input::text, output::text, llm_info::text FROM {fq_store_table('llm_requests')} WHERE id = $1",
                 decoded_request_id,
             )
             serialized_row = await conn.fetchrow(
-                f"SELECT input::text, output::text FROM {fq_table('llm_requests')} WHERE id = $1",
+                f"SELECT input::text, output::text FROM {fq_store_table('llm_requests')} WHERE id = $1",
                 serialized_request_id,
             )
             assert decoded_row is not None
@@ -403,7 +449,7 @@ async def test_restore_rows_normalizes_jsonb_strings(memory):
             assert json.loads(serialized_row["output"]) == {"answer": "serialized object"}
         finally:
             await conn.execute(
-                f"DELETE FROM {fq_table('llm_requests')} WHERE id = ANY($1)",
+                f"DELETE FROM {fq_store_table('llm_requests')} WHERE id = ANY($1)",
                 [decoded_request_id, serialized_request_id],
             )
 
@@ -421,7 +467,7 @@ async def test_export_bank_contents(memory, request_context):
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"INSERT INTO {fq_table('webhooks')} "
+                f"INSERT INTO {fq_store_table('webhooks')} "
                 f"(id, bank_id, url, secret, event_types, enabled, created_at, updated_at) "
                 f"VALUES ($1, $2, $3, NULL, $4, true, NOW(), NOW())",
                 webhook_id,
@@ -483,7 +529,7 @@ async def test_export_tolerates_legacy_null_and_numeric_fact_metadata(memory, re
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             updated = await conn.execute(
-                f"UPDATE {fq_table('memory_units')} SET metadata = $2::jsonb WHERE bank_id = $1",
+                f"UPDATE {fq_store_table('memory_units')} SET metadata = $2::jsonb WHERE bank_id = $1",
                 bank,
                 json.dumps({"ocr_engine": None, "original_id": 348}),
             )
@@ -508,36 +554,37 @@ async def _bank_content_snapshot(memory, bank_id):
     backend = await memory._get_backend()
     async with acquire_with_retry(backend) as conn:
         bank = await conn.fetchrow(
-            f"SELECT name, disposition, mission, config FROM {fq_table('banks')} WHERE bank_id = $1", bank_id
+            f"SELECT name, disposition, mission, config FROM {fq_store_table('banks')} WHERE bank_id = $1", bank_id
         )
         docs = await conn.fetch(
-            f"SELECT id, original_text, tags, created_at FROM {fq_table('documents')} WHERE bank_id = $1", bank_id
+            f"SELECT id, original_text, tags, created_at FROM {fq_store_table('documents')} WHERE bank_id = $1", bank_id
         )
         facts = await conn.fetch(
-            f"SELECT text, fact_type, context FROM {fq_table('memory_units')} "
+            f"SELECT text, fact_type, context FROM {fq_store_table('memory_units')} "
             f"WHERE bank_id = $1 AND fact_type != 'observation'",
             bank_id,
         )
         obs = await conn.fetch(
-            f"SELECT text, proof_count FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
+            f"SELECT text, proof_count FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
             bank_id,
         )
-        ents = await conn.fetch(f"SELECT canonical_name FROM {fq_table('entities')} WHERE bank_id = $1", bank_id)
+        ents = await conn.fetch(f"SELECT canonical_name FROM {fq_store_table('entities')} WHERE bank_id = $1", bank_id)
         links = await conn.fetch(
-            f"SELECT link_type, count(*) AS c FROM {fq_table('memory_links')} WHERE bank_id = $1 GROUP BY link_type",
+            f"SELECT link_type, count(*) AS c FROM {fq_store_table('memory_links')} WHERE bank_id = $1 GROUP BY link_type",
             bank_id,
         )
         hooks = await conn.fetch(
-            f"SELECT url, event_types, enabled FROM {fq_table('webhooks')} WHERE bank_id = $1", bank_id
+            f"SELECT url, event_types, enabled FROM {fq_store_table('webhooks')} WHERE bank_id = $1", bank_id
         )
         dirs = await conn.fetch(
-            f"SELECT name, content, priority, is_active FROM {fq_table('directives')} WHERE bank_id = $1", bank_id
+            f"SELECT name, content, priority, is_active FROM {fq_store_table('directives')} WHERE bank_id = $1", bank_id
         )
         mms = await conn.fetch(
-            f"SELECT subtype, name, description, tags FROM {fq_table('mental_models')} WHERE bank_id = $1", bank_id
+            f"SELECT subtype, name, description, tags FROM {fq_store_table('mental_models')} WHERE bank_id = $1",
+            bank_id,
         )
         null_emb = await conn.fetchval(
-            f"SELECT count(*) FROM {fq_table('memory_units')} "
+            f"SELECT count(*) FROM {fq_store_table('memory_units')} "
             f"WHERE bank_id = $1 AND fact_type != 'observation' AND embedding IS NULL",
             bank_id,
         )
@@ -567,7 +614,7 @@ async def _fact_lifecycle(memory, bank_id):
     async with acquire_with_retry(backend) as conn:
         rows = await conn.fetch(
             f"SELECT text, created_at, consolidated_at, consolidation_failed_at "
-            f"FROM {fq_table('memory_units')} "
+            f"FROM {fq_store_table('memory_units')} "
             f"WHERE bank_id = $1 AND fact_type IN ('world', 'experience')",
             bank_id,
         )
@@ -580,7 +627,7 @@ async def _eligible_fact_count(memory, bank_id):
     backend = await memory._get_backend()
     async with acquire_with_retry(backend) as conn:
         return await conn.fetchval(
-            f"SELECT COUNT(*) FROM {fq_table('memory_units')} "
+            f"SELECT COUNT(*) FROM {fq_store_table('memory_units')} "
             f"WHERE bank_id = $1 AND fact_type IN ('world', 'experience') "
             f"AND consolidated_at IS NULL AND consolidation_failed_at IS NULL",
             bank_id,
@@ -591,7 +638,7 @@ async def _observation_count(memory, bank_id):
     backend = await memory._get_backend()
     async with acquire_with_retry(backend) as conn:
         return await conn.fetchval(
-            f"SELECT COUNT(*) FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
+            f"SELECT COUNT(*) FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
             bank_id,
         )
 
@@ -622,7 +669,7 @@ async def test_bank_import_preserves_consolidation_lifecycle(memory, request_con
         # only observation is the one created explicitly below.
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
+                f"DELETE FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'observation'",
                 bank,
             )
 
@@ -630,7 +677,7 @@ async def test_bank_import_preserves_consolidation_lifecycle(memory, request_con
             wf_ids = [
                 r["id"]
                 for r in await conn.fetch(
-                    f"SELECT id FROM {fq_table('memory_units')} "
+                    f"SELECT id FROM {fq_store_table('memory_units')} "
                     f"WHERE bank_id = $1 AND fact_type IN ('world', 'experience') ORDER BY created_at, id",
                     bank,
                 )
@@ -657,7 +704,7 @@ async def test_bank_import_preserves_consolidation_lifecycle(memory, request_con
         assert uuid.UUID(str(failed_fact_id)) not in obs_source_ids
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"UPDATE {fq_table('memory_units')} "
+                f"UPDATE {fq_store_table('memory_units')} "
                 f"SET consolidated_at = $2, consolidation_failed_at = NULL "
                 f"WHERE bank_id = $1 AND fact_type IN ('world', 'experience') AND id != $3",
                 bank,
@@ -665,7 +712,7 @@ async def test_bank_import_preserves_consolidation_lifecycle(memory, request_con
                 failed_fact_id,
             )
             await conn.execute(
-                f"UPDATE {fq_table('memory_units')} "
+                f"UPDATE {fq_store_table('memory_units')} "
                 f"SET consolidated_at = NULL, consolidation_failed_at = $2 "
                 f"WHERE bank_id = $1 AND id = $3",
                 bank,
@@ -711,7 +758,7 @@ async def test_bank_export_import_exact_roundtrip(memory, request_context):
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"UPDATE {fq_table('banks')} SET name = $2, disposition = $3::jsonb, "
+                f"UPDATE {fq_store_table('banks')} SET name = $2, disposition = $3::jsonb, "
                 f"mission = $4, config = $5::jsonb WHERE bank_id = $1",
                 bank,
                 "My Bank",
@@ -720,7 +767,7 @@ async def test_bank_export_import_exact_roundtrip(memory, request_context):
                 json.dumps({"reflect_mission": "be terse"}),
             )
             await conn.execute(
-                f"INSERT INTO {fq_table('webhooks')} "
+                f"INSERT INTO {fq_store_table('webhooks')} "
                 f"(id, bank_id, url, secret, event_types, enabled, created_at, updated_at) "
                 f"VALUES ($1, $2, $3, NULL, $4, true, NOW(), NOW())",
                 uuid.uuid4(),
@@ -729,7 +776,7 @@ async def test_bank_export_import_exact_roundtrip(memory, request_context):
                 ["retain.completed", "consolidation.completed"],
             )
             await conn.execute(
-                f"INSERT INTO {fq_table('directives')} "
+                f"INSERT INTO {fq_store_table('directives')} "
                 f"(id, bank_id, name, content, priority, is_active, tags, created_at, updated_at) "
                 f"VALUES ($1, $2, $3, $4, $5, true, $6, NOW(), NOW())",
                 uuid.uuid4(),
@@ -768,15 +815,18 @@ async def test_bank_export_import_exact_roundtrip(memory, request_context):
         assert result.mental_models_imported == 1
 
         after = await _bank_content_snapshot(memory, bank)
-        # Semantic links are an ANN-approximate retrieval index regenerated from the
-        # (re-embedded) facts; their count depends on whether ANN runs incrementally
-        # per document (import) or as a final whole-bank pass (original retain), so
-        # compare them loosely. Everything else — source data and deterministic
-        # temporal links — must match exactly.
+        # Semantic and temporal links are retrieval indexes regenerated from the facts,
+        # and both depend on which facts are written together: import writes many
+        # documents per batch, linking them to each other both ways, where the original
+        # retains linked each document only to the ones before it. So compare them
+        # loosely. Everything else — the source data — must match exactly.
         after_semantic = after["links"].pop("semantic", 0)
+        after_temporal = after["links"].pop("temporal", 0)
         before["links"].pop("semantic", None)
+        before["links"].pop("temporal", None)
         assert after == before
         assert after_semantic > 0, "semantic links should be regenerated on import"
+        assert after_temporal > 0, "temporal links should be regenerated on import"
         # Facts were re-embedded on import (no NULL vectors).
         assert after["null_embeddings"] == 0
     finally:
@@ -798,7 +848,8 @@ async def test_bank_roundtrip_remaps_mental_model_based_on_ids(memory, request_c
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             fact_id = await conn.fetchval(
-                f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'world' LIMIT 1", bank
+                f"SELECT id FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'world' LIMIT 1",
+                bank,
             )
         await memory.create_mental_model(
             bank,
@@ -813,7 +864,7 @@ async def test_bank_roundtrip_remaps_mental_model_based_on_ids(memory, request_c
         # during refresh and cannot create a deterministic source-id fixture.
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"UPDATE {fq_table('mental_models')} SET reflect_response = $3::jsonb WHERE bank_id = $1 AND id = $2",
+                f"UPDATE {fq_store_table('mental_models')} SET reflect_response = $3::jsonb WHERE bank_id = $1 AND id = $2",
                 bank,
                 "mm-based-on",
                 json.dumps({"text": "Alice works at Google.", "based_on": based_on}),
@@ -840,7 +891,7 @@ async def test_bank_roundtrip_remaps_mental_model_based_on_ids(memory, request_c
             live_ids = {
                 str(row["id"])
                 for row in await conn.fetch(
-                    f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'world'", bank
+                    f"SELECT id FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND fact_type = 'world'", bank
                 )
             }
         assert restored_ids <= live_ids
@@ -880,7 +931,7 @@ async def test_bank_import_into_new_id_on_same_instance(memory, request_context)
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             source_internal_id = await conn.fetchval(
-                f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", source
+                f"SELECT internal_id FROM {fq_store_table('banks')} WHERE bank_id = $1", source
             )
 
         from hindsight_api.engine.transfer import export_bank
@@ -894,7 +945,7 @@ async def test_bank_import_into_new_id_on_same_instance(memory, request_context)
 
         async with acquire_with_retry(backend) as conn:
             target_internal_id = await conn.fetchval(
-                f"SELECT internal_id FROM {fq_table('banks')} WHERE bank_id = $1", target
+                f"SELECT internal_id FROM {fq_store_table('banks')} WHERE bank_id = $1", target
             )
         # The copy exists (parent row landed) and got a fresh, non-colliding id.
         assert target_internal_id is not None
@@ -1001,7 +1052,7 @@ async def test_bank_roundtrip_carries_knowledge_pages(memory, request_context):
         # the vector and lexical arms of knowledge search work again.
         async with acquire_with_retry(backend) as conn:
             null_embeddings = await conn.fetchval(
-                f"SELECT count(*) FROM {fq_table('mental_models')} WHERE bank_id = $1 AND embedding IS NULL",
+                f"SELECT count(*) FROM {fq_store_table('mental_models')} WHERE bank_id = $1 AND embedding IS NULL",
                 bank,
             )
         assert null_embeddings == 0, "restored mental models must be re-embedded"
@@ -1043,6 +1094,83 @@ async def test_import_bank_refuses_existing_bank(memory, request_context):
             await memory.import_bank_async(archive, request_context)
     finally:
         await memory.delete_bank(bank, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_target", ["b" * 300, "imp\nbad", "_reserved"], ids=["too-long", "newline", "underscore"])
+async def test_bank_import_refuses_an_invalid_new_bank_id(memory, request_context, bad_target):
+    """A restore applies the same id rules as a direct create, on both the HTTP submit and the
+    direct restore the admin CLI uses, and creates no bank (#5540)."""
+    source = _unique_bank("import_bad_id_src")
+    try:
+        await _retain(memory, source, "Alice works at Google.", request_context, "doc-1")
+        archive = await _export_bank_archive(memory, source)
+        with pytest.raises(OperationValidationError) as submitted:
+            await memory.submit_bank_import_async(source, archive, request_context, target_bank_id=bad_target)
+        assert submitted.value.status_code == 400
+        with pytest.raises(OperationValidationError) as restored:
+            await memory.import_bank_async(archive, request_context, target_bank_id=bad_target)
+        assert restored.value.status_code == 400
+        backend = await memory._get_backend()
+        assert await bank_utils.bank_exists(backend, bad_target) is False
+    finally:
+        await memory.delete_bank(source, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_import_bank_retried_after_a_crash_starts_over(memory, request_context, monkeypatch):
+    """A worker that dies mid-import leaves a half-restored bank; the retry must finish the job.
+
+    It used to fail on its own leftovers ("target bank already exists"). The retry now
+    recognises the bank as the one its operation created, deletes it and restores again.
+    """
+    from hindsight_api.engine.transfer import export_bank, importer
+    from hindsight_api.worker.exceptions import RetryTaskAt
+
+    src = _unique_bank("bank_crash_src")
+    dst = _unique_bank("bank_crash_dst")
+    try:
+        await _retain(memory, src, "Alice works at Google.", request_context, "doc-1")
+        await _retain(memory, src, "Carol lives in Paris.", request_context, "doc-2")
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            archive = await export_bank(conn, src)
+
+        # One document per batch, and the second batch "crashes" after the first committed.
+        monkeypatch.setattr(importer, "_DOCUMENT_BATCH_SIZE", 1)
+        real_batch = importer._import_document_batch
+        calls = 0
+
+        async def crash_on_second_batch(**kwargs: Any) -> list[importer._ImportedFactBatch]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("worker died")
+            return await real_batch(**kwargs)
+
+        monkeypatch.setattr(importer, "_import_document_batch", crash_on_second_batch)
+        # The task layer turns the failure into a scheduled retry — the retry this test runs below.
+        with pytest.raises(RetryTaskAt, match="worker died"):
+            await memory.submit_bank_import_async(src, archive, request_context, target_bank_id=dst)
+        operations = await memory.list_operations(src, request_context=request_context)
+        [operation_id] = [op["id"] for op in operations["operations"] if op["task_type"] == "import_bank"]
+        # The crash left a partial bank behind.
+        assert (await memory.list_documents(dst, request_context=request_context))["total"] == 1
+
+        # The retry, as the worker runs it after a restart.
+        monkeypatch.setattr(importer, "_import_document_batch", real_batch)
+        result = await memory.import_bank_async(archive, request_context, target_bank_id=dst, operation_id=operation_id)
+        assert result.documents_imported == 2
+        assert (await memory.list_documents(dst, request_context=request_context))["total"] == 2
+
+        # A bank the operation did not create is still refused, never deleted.
+        with pytest.raises(ValueError, match="already exists"):
+            await memory.import_bank_async(archive, request_context, operation_id=operation_id)
+        assert (await memory.list_documents(src, request_context=request_context))["total"] == 2
+    finally:
+        await memory.delete_bank(src, request_context=request_context)
+        await memory.delete_bank(dst, request_context=request_context)
 
 
 @pytest.mark.asyncio
@@ -1106,7 +1234,7 @@ async def test_export_import_roundtrip_without_llm(memory, request_context, monk
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             null_embeddings = await conn.fetchval(
-                f"SELECT COUNT(*) FROM {fq_table('memory_units')} WHERE bank_id = $1 AND embedding IS NULL",
+                f"SELECT COUNT(*) FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND embedding IS NULL",
                 dst,
             )
         assert null_embeddings == 0
@@ -1124,31 +1252,31 @@ async def _bank_snapshot(memory, bank_id):
     backend = await memory._get_backend()
     async with acquire_with_retry(backend) as conn:
         docs = await conn.fetch(
-            f"SELECT id, COALESCE(length(original_text), 0) AS len FROM {fq_table('documents')} WHERE bank_id = $1",
+            f"SELECT id, COALESCE(length(original_text), 0) AS len FROM {fq_store_table('documents')} WHERE bank_id = $1",
             bank_id,
         )
         chunks = await conn.fetch(
-            f"SELECT document_id, chunk_index, length(chunk_text) AS len FROM {fq_table('chunks')} WHERE bank_id = $1",
+            f"SELECT document_id, chunk_index, length(chunk_text) AS len FROM {fq_store_table('chunks')} WHERE bank_id = $1",
             bank_id,
         )
         ftypes = await conn.fetch(
-            f"SELECT fact_type, count(*) AS c FROM {fq_table('memory_units')} WHERE bank_id = $1 GROUP BY fact_type",
+            f"SELECT fact_type, count(*) AS c FROM {fq_store_table('memory_units')} WHERE bank_id = $1 GROUP BY fact_type",
             bank_id,
         )
         links = await conn.fetch(
-            f"SELECT ml.link_type, count(*) AS c FROM {fq_table('memory_links')} ml "
-            f"JOIN {fq_table('memory_units')} m ON m.id = ml.from_unit_id "
+            f"SELECT ml.link_type, count(*) AS c FROM {fq_store_table('memory_links')} ml "
+            f"JOIN {fq_store_table('memory_units')} m ON m.id = ml.from_unit_id "
             f"WHERE m.bank_id = $1 GROUP BY ml.link_type",
             bank_id,
         )
         unit_entities = await conn.fetchval(
-            f"SELECT count(*) FROM {fq_table('unit_entities')} ue "
-            f"JOIN {fq_table('memory_units')} m ON m.id = ue.unit_id WHERE m.bank_id = $1",
+            f"SELECT count(*) FROM {fq_store_table('unit_entities')} ue "
+            f"JOIN {fq_store_table('memory_units')} m ON m.id = ue.unit_id WHERE m.bank_id = $1",
             bank_id,
         )
-        entities = await conn.fetchval(f"SELECT count(*) FROM {fq_table('entities')} WHERE bank_id = $1", bank_id)
+        entities = await conn.fetchval(f"SELECT count(*) FROM {fq_store_table('entities')} WHERE bank_id = $1", bank_id)
         facts_with_chunk = await conn.fetchval(
-            f"SELECT count(*) FROM {fq_table('memory_units')} WHERE bank_id = $1 AND chunk_id IS NOT NULL",
+            f"SELECT count(*) FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND chunk_id IS NOT NULL",
             bank_id,
         )
     by_type = {r["fact_type"]: r["c"] for r in ftypes}
@@ -1207,14 +1335,14 @@ async def test_full_roundtrip_integrity(memory, request_context):
         # Entities + entity links re-resolved to the same counts.
         assert after["entities"] == before["entities"]
         assert after["unit_entities"] == before["unit_entities"]
-        # Links are regenerated against the target bank; for the same facts/embeddings
-        # the deterministic temporal + causal links must match exactly.
-        for link_type in ("temporal", "caused_by"):
-            assert after["links_by_type"].get(link_type, 0) == before["links_by_type"].get(link_type, 0), (
-                link_type,
-                before["links_by_type"],
-                after["links_by_type"],
-            )
+        # Links are regenerated against the target bank. Causal links are carried by the
+        # facts and must match exactly; temporal links depend on which documents are
+        # written together (import batches them, retain wrote one at a time).
+        assert after["links_by_type"].get("caused_by", 0) == before["links_by_type"].get("caused_by", 0), (
+            before["links_by_type"],
+            after["links_by_type"],
+        )
+        assert after["links_by_type"].get("temporal", 0) > 0
         # And links overall must be present (semantic counts can vary slightly with
         # ANN ordering, so we don't assert exact equality on the total).
         assert after["links_total"] > 0
@@ -1248,7 +1376,7 @@ async def test_transfer_preserves_legacy_causal_links(memory, request_context):
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             await conn.executemany(
-                f"INSERT INTO {fq_table('memory_links')} "
+                f"INSERT INTO {fq_store_table('memory_links')} "
                 "(from_unit_id, to_unit_id, link_type, entity_id, bank_id, weight) "
                 "VALUES ($1, $2, $3, NULL, $4, 1.0)",
                 [(from_unit_id, to_unit_id, link_type, src) for link_type in legacy_types],
@@ -1260,9 +1388,9 @@ async def test_transfer_preserves_legacy_causal_links(memory, request_context):
         async with acquire_with_retry(backend) as conn:
             imported_types = await conn.fetch(
                 f"SELECT ml.link_type, source.text AS source_text, target.text AS target_text "
-                f"FROM {fq_table('memory_links')} ml "
-                f"JOIN {fq_table('memory_units')} source ON source.id = ml.from_unit_id "
-                f"JOIN {fq_table('memory_units')} target ON target.id = ml.to_unit_id "
+                f"FROM {fq_store_table('memory_links')} ml "
+                f"JOIN {fq_store_table('memory_units')} source ON source.id = ml.from_unit_id "
+                f"JOIN {fq_store_table('memory_units')} target ON target.id = ml.to_unit_id "
                 "WHERE ml.bank_id = $1 AND ml.link_type = ANY($2)",
                 dst,
                 list(legacy_types),
@@ -1301,7 +1429,7 @@ async def test_export_import_observations(memory, request_context):
         )
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"UPDATE {fq_table('memory_units')} SET event_date = $1 "
+                f"UPDATE {fq_store_table('memory_units')} SET event_date = $1 "
                 f"WHERE bank_id = $2 AND fact_type = 'observation' AND text = $3",
                 archived_event_date,
                 src,
@@ -1335,7 +1463,7 @@ async def test_export_import_observations(memory, request_context):
         # and those source facts are marked consolidated.
         async with acquire_with_retry(backend) as conn:
             obs_row = await conn.fetchrow(
-                f"SELECT source_memory_ids, event_date FROM {fq_table('memory_units')} "
+                f"SELECT source_memory_ids, event_date FROM {fq_store_table('memory_units')} "
                 f"WHERE bank_id = $1 AND fact_type = 'observation' AND text = $2",
                 dst,
                 "Alice and Bob are colleagues.",
@@ -1345,7 +1473,7 @@ async def test_export_import_observations(memory, request_context):
             dst_sources = list(obs_row["source_memory_ids"] or [])
             assert len(dst_sources) == 2
             consolidated = await conn.fetchval(
-                f"SELECT COUNT(*) FROM {fq_table('memory_units')} "
+                f"SELECT COUNT(*) FROM {fq_store_table('memory_units')} "
                 f"WHERE bank_id = $1 AND id = ANY($2) AND consolidated_at IS NOT NULL",
                 dst,
                 dst_sources,
@@ -1354,6 +1482,59 @@ async def test_export_import_observations(memory, request_context):
     finally:
         await memory.delete_bank(src, request_context=request_context)
         await memory.delete_bank(dst, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_import_observations_in_bounded_batches(memory, request_context, monkeypatch):
+    """Observations go in one transaction per batch, and every batch is counted (#5418).
+
+    One insert for the whole set outgrew PostgreSQL's 1 GB message on a large bank.
+    """
+    from hindsight_api.engine.transfer import importer
+
+    src = _unique_bank("transfer_obs_batch_src")
+    dst = _unique_bank("transfer_obs_batch_dst")
+    try:
+        created = await _retain(memory, src, "Alice works at Google. Bob works at Microsoft.", request_context, "doc-1")
+        assert len(created) >= 2, f"setup: retain created {len(created)} facts, need at least 2"
+        backend = await memory._get_backend()
+        for index, text in enumerate(["Alice is employed.", "Bob is employed."]):
+            await _seed_observation(
+                pool=backend,
+                memory=memory,
+                bank_id=src,
+                source_memory_ids=[uuid.UUID(str(created[index]))],
+                observation_text=text,
+            )
+        archive = await memory.export_documents_async(src, request_context, include_observations=True)
+        exported = parse_archive(archive).manifest.observation_count
+        assert exported >= 2
+
+        monkeypatch.setattr(importer, "_OBSERVATION_BATCH_SIZE", 1)
+        result = await _import(memory, dst, archive, request_context)
+
+        assert result["observations_imported"] == exported
+        stored = await memory.list_memory_units(dst, fact_type="observation", request_context=request_context)
+        assert stored["total"] == exported
+    finally:
+        await memory.delete_bank(src, request_context=request_context)
+        await memory.delete_bank(dst, request_context=request_context)
+
+
+def test_document_batches_cap_documents_and_facts(monkeypatch):
+    """A batch closes at the document cap or the fact cap; a document over the fact cap rides alone."""
+    from hindsight_api.engine.transfer import importer
+
+    monkeypatch.setattr(importer, "_DOCUMENT_BATCH_SIZE", 3)
+    monkeypatch.setattr(importer, "_FACT_BATCH_SIZE", 10)
+
+    def doc(doc_id: str, facts: int) -> TransferDocument:
+        return TransferDocument(id=doc_id, facts=[TransferFact(text="f", fact_type="world")] * facts)
+
+    docs = [doc("a", 4), doc("b", 4), doc("c", 4), doc("d", 25), doc("e", 1), doc("f", 1), doc("g", 1), doc("h", 1)]
+    batches = [[document.id for document in batch] for batch in importer._document_batches(iter(docs))]
+
+    assert batches == [["a", "b"], ["c"], ["d"], ["e", "f", "g"], ["h"]]
 
 
 @pytest.mark.asyncio
@@ -1438,7 +1619,7 @@ async def test_import_fires_retain_complete_hook(memory, request_context):
     await _retain(memory, src, "Bob works at Microsoft.", request_context, "doc-2")
     archive = await memory.export_documents_async(src, request_context)
 
-    capture = _RetainResultCapture()
+    capture = RetainResultCapture()
     original_validator = memory._operation_validator
     memory._operation_validator = capture
     try:
@@ -1458,8 +1639,208 @@ async def test_import_fires_retain_complete_hook(memory, request_context):
             assert res.llm_output_tokens == 0
             assert res.llm_total_tokens == 0
             assert res.processed_content_tokens == 0
+            # ...which a re-retain the chunk dedup skipped also reports, so the
+            # result says it is an import, and carries the document's text.
+            assert res.source == RetainSource.IMPORT
+            assert res.contents[0]["content"] in ("Alice works at Google.", "Bob works at Microsoft.")
             # unit_ids are reported per content item, with the created facts.
             assert res.unit_ids and res.unit_ids[0]
+    finally:
+        memory._operation_validator = original_validator
+        await memory.delete_bank(src, request_context=request_context)
+        await memory.delete_bank(dst, request_context=request_context)
+
+
+class _ImportGateValidator(RetainResultCapture):
+    """Records every import gate call and refuses imports when told to."""
+
+    def __init__(self, *, refuse: bool = False) -> None:
+        super().__init__()
+        self.refuse = refuse
+        self.imports: list[ImportContext] = []
+
+    async def validate_import(self, ctx: ImportContext) -> ValidationResult:
+        self.imports.append(ctx)
+        if self.refuse:
+            return ValidationResult.reject("import not permitted", status_code=402)
+        return ValidationResult.accept()
+
+
+async def _export_bank_archive(memory, bank_id) -> bytes:
+    from hindsight_api.engine.transfer import export_bank
+
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        return await export_bank(conn, bank_id)
+
+
+@pytest.mark.asyncio
+async def test_retain_reports_retain_source(memory, request_context):
+    """An ordinary retain is reported as RETAIN, so only imports are marked IMPORT."""
+    bank = _unique_bank("transfer_source_retain")
+    capture = RetainResultCapture()
+    original_validator = memory._operation_validator
+    memory._operation_validator = capture
+    try:
+        await _retain(memory, bank, "Alice works at Google.", request_context, "doc-1")
+        assert [r.source for r in capture.results] == [RetainSource.RETAIN]
+    finally:
+        memory._operation_validator = original_validator
+        await memory.delete_bank(bank, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_bank_restore_reports_each_document_as_imported(memory, request_context):
+    """A whole-bank restore brings documents in just as a document import does, so it
+    reports them the same way: once each, as IMPORT, with zero tokens."""
+    source = _unique_bank("restore_hook_src")
+    target = _unique_bank("restore_hook_dst")
+    await _retain(memory, source, "Alice works at Google.", request_context, "doc-1")
+    await _retain(memory, source, "Bob works at Microsoft.", request_context, "doc-2")
+    archive = await _export_bank_archive(memory, source)
+
+    gate = _ImportGateValidator()
+    original_validator = memory._operation_validator
+    memory._operation_validator = gate
+    try:
+        submission = await memory.submit_bank_import_async(source, archive, request_context, target_bank_id=target)
+        status = await memory.get_operation_status(source, submission["operation_id"], request_context=request_context)
+        assert status["status"] == "completed", status
+
+        assert [(c.bank_id, sorted(d.document_id for d in c.documents)) for c in gate.imports] == [
+            (target, ["doc-1", "doc-2"])
+        ]
+        assert sorted(r.document_id for r in gate.results) == ["doc-1", "doc-2"]
+        for res in gate.results:
+            assert res.bank_id == target
+            assert res.source == RetainSource.IMPORT
+            assert res.llm_total_tokens == 0
+            assert res.processed_content_tokens == 0
+            assert res.unit_ids and res.unit_ids[0]
+    finally:
+        memory._operation_validator = original_validator
+        await memory.delete_bank(source, request_context=request_context)
+        await memory.delete_bank(target, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_clone_reports_nothing_as_imported(memory, request_context):
+    """A clone copies documents the tenant already has: it is neither gated nor reported
+    as an import, though it runs the same restore underneath."""
+    source = _unique_bank("clone_hook_src")
+    target = _unique_bank("clone_hook_dst")
+    await _retain(memory, source, "Alice works at Google.", request_context, "doc-1")
+
+    gate = _ImportGateValidator()
+    original_validator = memory._operation_validator
+    memory._operation_validator = gate
+    try:
+        submission = await memory.submit_bank_clone_async(source, target, request_context)
+        status = await memory.get_operation_status(source, submission["operation_id"], request_context=request_context)
+        assert status["status"] == "completed", status
+        clone_facts = await memory.list_memory_units(target, limit=100, request_context=request_context)
+        assert clone_facts["total"] > 0
+
+        assert gate.imports == []
+        assert gate.results == []
+    finally:
+        memory._operation_validator = original_validator
+        await memory.delete_bank(source, request_context=request_context)
+        await memory.delete_bank(target, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_import_gate_sees_the_archive_and_can_refuse_a_document_import(memory, request_context):
+    """The gate runs at submission with the archive's documents; a refusal reaches the
+    caller and nothing is queued or written."""
+    src = _unique_bank("import_gate_src")
+    dst = _unique_bank("import_gate_dst")
+    await _retain(memory, src, "Alice works at Google.", request_context, "doc-1")
+    archive = await memory.export_documents_async(src, request_context)
+
+    gate = _ImportGateValidator(refuse=True)
+    original_validator = memory._operation_validator
+    memory._operation_validator = gate
+    try:
+        with pytest.raises(OperationValidationError) as exc:
+            await memory.import_documents_async(dst, archive, request_context)
+        assert exc.value.status_code == 402
+        assert [(c.bank_id, c.documents) for c in gate.imports] == [
+            (dst, [ImportArchiveDocument(document_id="doc-1", content="Alice works at Google.")])
+        ]
+        assert gate.results == []
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            exists = await conn.fetchval(f"SELECT 1 FROM {fq_store_table('banks')} WHERE bank_id = $1", dst)
+        assert exists is None, "a refused import must not create the bank"
+    finally:
+        memory._operation_validator = original_validator
+        await memory.delete_bank(src, request_context=request_context)
+        await memory.delete_bank(dst, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_import_gate_can_refuse_a_bank_restore(memory, request_context):
+    """A refused restore never creates the target bank."""
+    source = _unique_bank("restore_gate_src")
+    target = _unique_bank("restore_gate_dst")
+    await _retain(memory, source, "Alice works at Google.", request_context, "doc-1")
+    archive = await _export_bank_archive(memory, source)
+
+    gate = _ImportGateValidator(refuse=True)
+    original_validator = memory._operation_validator
+    memory._operation_validator = gate
+    try:
+        with pytest.raises(OperationValidationError):
+            await memory.submit_bank_import_async(source, archive, request_context, target_bank_id=target)
+        assert [c.bank_id for c in gate.imports] == [target]
+        assert gate.results == []
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            exists = await conn.fetchval(f"SELECT 1 FROM {fq_store_table('banks')} WHERE bank_id = $1", target)
+        assert exists is None
+    finally:
+        memory._operation_validator = original_validator
+        await memory.delete_bank(source, request_context=request_context)
+
+
+class _ImportRejectingValidator(RetainResultCapture):
+    """Rejects bank writes to one bank, the way a bank-scoped API key policy would."""
+
+    def __init__(self, forbidden_bank: str) -> None:
+        super().__init__()
+        self.forbidden_bank = forbidden_bank
+        self.writes: list[BankWriteContext] = []
+
+    async def validate_bank_write(self, ctx: BankWriteContext) -> ValidationResult:
+        self.writes.append(ctx)
+        if ctx.bank_id == self.forbidden_bank:
+            return ValidationResult.reject("bank not permitted", status_code=403)
+        return ValidationResult.accept()
+
+
+@pytest.mark.asyncio
+async def test_import_into_existing_bank_runs_bank_write_validator(memory, request_context):
+    """Importing into a bank that already exists goes through validate_bank_write (#5137).
+
+    Before, only a brand-new bank was gated (by validate_create_bank), so a validator
+    scoping keys to banks never saw an import into someone else's existing bank.
+    """
+    src = _unique_bank("transfer_guard_src")
+    dst = _unique_bank("transfer_guard_dst")
+    await _retain(memory, src, "Alice works at Google.", request_context, "doc-1")
+    await _retain(memory, dst, "Bob works at Microsoft.", request_context, "doc-2")
+    archive = await memory.export_documents_async(src, request_context)
+
+    validator = _ImportRejectingValidator(forbidden_bank=dst)
+    original_validator = memory._operation_validator
+    memory._operation_validator = validator
+    try:
+        with pytest.raises(OperationValidationError) as exc:
+            await memory.import_documents_async(dst, archive, request_context)
+        assert exc.value.status_code == 403
+        assert [(w.bank_id, w.operation) for w in validator.writes] == [(dst, BankWriteOperation.IMPORT_DOCUMENTS)]
+        assert validator.results == []
     finally:
         memory._operation_validator = original_validator
         await memory.delete_bank(src, request_context=request_context)
@@ -1480,12 +1861,12 @@ async def test_import_queues_retain_webhook(memory, request_context):
     backend = await memory._get_backend()
     async with acquire_with_retry(backend) as conn:
         await conn.execute(
-            f"INSERT INTO {fq_table('banks')} (bank_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            f"INSERT INTO {fq_store_table('banks')} (bank_id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             dst,
             dst,
         )
         await conn.execute(
-            f"INSERT INTO {fq_table('webhooks')} "
+            f"INSERT INTO {fq_store_table('webhooks')} "
             f"(id, bank_id, url, secret, event_types, enabled, created_at, updated_at) "
             f"VALUES ($1, $2, $3, NULL, $4, true, NOW(), NOW())",
             webhook_id,
@@ -1501,7 +1882,7 @@ async def test_import_queues_retain_webhook(memory, request_context):
 
         async with acquire_with_retry(backend) as conn:
             rows = await conn.fetch(
-                f"SELECT task_payload FROM {fq_table('async_operations')} "
+                f"SELECT task_payload FROM {fq_store_table('async_operations')} "
                 f"WHERE operation_type = 'webhook_delivery' AND bank_id = $1 "
                 f"AND task_payload->>'event_type' = 'retain.completed'",
                 dst,
@@ -1747,7 +2128,7 @@ async def test_import_rejects_invalid_on_conflict(memory, request_context):
             config=None,
             format_date_fn=memory._format_readable_date,
             bank_id="any-bank",
-            archive_bytes=buffer.getvalue(),
+            archive=buffer.getvalue(),
             on_conflict="bogus",
         )
 
@@ -1786,7 +2167,7 @@ async def test_bank_import_classifies_label_entities(memory, request_context):
             # Must be an exported fact type attached to a document, or export
             # never sees the link and the archive carries no entities at all.
             unit_id = await conn.fetchval(
-                f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 "
+                f"SELECT id FROM {fq_store_table('memory_units')} WHERE bank_id = $1 "
                 "AND document_id IS NOT NULL AND fact_type IN ('world', 'experience') LIMIT 1",
                 bank,
             )
@@ -1794,16 +2175,16 @@ async def test_bank_import_classifies_label_entities(memory, request_context):
             for name in (label_entity, regular_entity):
                 # Retain may already have created the regular one.
                 entity_id = await conn.fetchval(
-                    f"SELECT id FROM {fq_table('entities')} WHERE bank_id = $1 AND LOWER(canonical_name) = LOWER($2)",
+                    f"SELECT id FROM {fq_store_table('entities')} WHERE bank_id = $1 AND LOWER(canonical_name) = LOWER($2)",
                     bank,
                     name,
                 ) or await conn.fetchval(
-                    f"INSERT INTO {fq_table('entities')} (bank_id, canonical_name) VALUES ($1, $2) RETURNING id",
+                    f"INSERT INTO {fq_store_table('entities')} (bank_id, canonical_name) VALUES ($1, $2) RETURNING id",
                     bank,
                     name,
                 )
                 await conn.execute(
-                    f"INSERT INTO {fq_table('unit_entities')} (unit_id, entity_id) VALUES ($1, $2) "
+                    f"INSERT INTO {fq_store_table('unit_entities')} (unit_id, entity_id) VALUES ($1, $2) "
                     "ON CONFLICT DO NOTHING",
                     unit_id,
                     entity_id,
@@ -1820,7 +2201,7 @@ async def test_bank_import_classifies_label_entities(memory, request_context):
             kinds = {
                 row["canonical_name"]: row["entity_kind"]
                 for row in await conn.fetch(
-                    f"SELECT canonical_name, entity_kind FROM {fq_table('entities')} WHERE bank_id = $1",
+                    f"SELECT canonical_name, entity_kind FROM {fq_store_table('entities')} WHERE bank_id = $1",
                     bank,
                 )
             }
@@ -1899,14 +2280,14 @@ async def test_export_attach_batching_preserves_entities_and_causal_links(memory
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             rows = await conn.fetch(
-                f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND document_id = 'doc-1' "
+                f"SELECT id FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND document_id = 'doc-1' "
                 "AND fact_type IN ('world', 'experience') ORDER BY created_at, id",
                 bank,
             )
             assert len(rows) >= 2, "need at least two facts to link"
             source_id, target_id = rows[0]["id"], rows[1]["id"]
             await conn.execute(
-                f"INSERT INTO {fq_table('memory_links')} (bank_id, from_unit_id, to_unit_id, link_type) "
+                f"INSERT INTO {fq_store_table('memory_links')} (bank_id, from_unit_id, to_unit_id, link_type) "
                 "VALUES ($1, $2, $3, 'caused_by') ON CONFLICT DO NOTHING",
                 bank,
                 source_id,
@@ -1975,12 +2356,12 @@ async def test_purge_expired_export_archives(memory, request_context):
         cutoff = datetime.now(timezone.utc) - timedelta(days=1)
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"UPDATE {fq_table('async_operations')} SET updated_at = $1 WHERE operation_id = $2",
+                f"UPDATE {fq_store_table('async_operations')} SET updated_at = $1 WHERE operation_id = $2",
                 old,
                 uuid.UUID(op_id),
             )
             purged = await memory.purge_expired_export_archives(
-                conn, fq_table("async_operations"), cutoff, batch_size=100
+                conn, fq_store_table("async_operations"), cutoff, batch_size=100
             )
         assert purged >= 1
         with pytest.raises(FileNotFoundError):
@@ -2008,12 +2389,12 @@ async def test_purge_expired_export_archives_includes_export_bank(memory, reques
         cutoff = datetime.now(timezone.utc) - timedelta(days=1)
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"UPDATE {fq_table('async_operations')} SET updated_at = $1 WHERE operation_id = $2",
+                f"UPDATE {fq_store_table('async_operations')} SET updated_at = $1 WHERE operation_id = $2",
                 old,
                 uuid.UUID(op_id),
             )
             purged = await memory.purge_expired_export_archives(
-                conn, fq_table("async_operations"), cutoff, batch_size=100
+                conn, fq_store_table("async_operations"), cutoff, batch_size=100
             )
         assert purged >= 1
         with pytest.raises(FileNotFoundError):
@@ -2047,7 +2428,7 @@ async def test_purge_expired_export_archives_honours_the_batch_bound(memory, req
         async with acquire_with_retry(backend) as conn:
             for i in range(2):
                 await conn.execute(
-                    f"""INSERT INTO {fq_table("async_operations")}
+                    f"""INSERT INTO {fq_store_table("async_operations")}
                         (operation_id, bank_id, operation_type, status, task_payload,
                          result_metadata, updated_at)
                         VALUES ($1, $2, 'export_documents', 'completed', '{{}}'::jsonb, $3::jsonb, $4)""",
@@ -2059,7 +2440,7 @@ async def test_purge_expired_export_archives_honours_the_batch_bound(memory, req
             # LIMIT 1 caps the result at one row regardless of which expired export
             # sorts first, so this holds even with other tests' rows in the schema.
             purged = await memory.purge_expired_export_archives(
-                conn, fq_table("async_operations"), cutoff, batch_size=1
+                conn, fq_store_table("async_operations"), cutoff, batch_size=1
             )
         assert purged == 1
     finally:
@@ -2093,7 +2474,18 @@ async def test_download_route_rejects_unauthorized_keys(api_client, memory, requ
 
 
 class _StoreOwnedMemories:
-    """A memories store that keeps memories outside SQL, like an external store extension."""
+    """A memories store that keeps memories outside SQL, like an external store extension.
+
+    Duck-typed rather than a full store, so the transfer entry points borrow the interface's
+    store-owned defaults — the code under test — and each fake supplies only the reads they make.
+    """
+
+    iter_transfer_documents = MemoriesExtension.iter_transfer_documents
+    load_transfer_documents = MemoriesExtension.load_transfer_documents
+    load_transfer_observations = MemoriesExtension.load_transfer_observations
+    dump_entity_maintenance_queue = MemoriesExtension.dump_entity_maintenance_queue
+    dump_archived_memories = MemoriesExtension.dump_archived_memories
+    transfer_document_exists = MemoriesExtension.transfer_document_exists
 
     def store_owned_for(self, bank_id: str) -> bool:
         return True
@@ -2257,11 +2649,6 @@ class _FakeStoreOwned(_StoreOwnedMemories):
         return {"e-ada": "Ada Lovelace"}
 
 
-class _SqlMemories:
-    def store_owned_for(self, bank_id: str) -> bool:
-        return False
-
-
 @pytest.mark.asyncio
 async def test_export_of_a_store_owned_bank_contains_its_memories():
     """The archive must carry the bank's facts, entities and causal edges — not be empty.
@@ -2290,6 +2677,8 @@ async def test_export_of_a_store_owned_bank_contains_its_memories():
 
     texts = [f["text"] for f in doc["facts"]]
     assert texts == ["the cause", "the effect"], texts
+    # Each fact names its id in this bank, so an import can repoint mental-model evidence at it.
+    assert [f["source_id"] for f in doc["facts"]] == ["unit-cause", "unit-effect"]
     # The entity name has to come back through the store's registry, not a SQL join.
     assert doc["facts"][0]["entities"] == ["Ada Lovelace"], doc["facts"][0]
     # And the causal edge has to survive as an ordinal into this document's fact list.
@@ -2329,7 +2718,7 @@ async def test_a_sql_backed_bank_is_not_read_through_the_store():
     from hindsight_api.engine.transfer.export import export_documents
 
     with pytest.raises(Exception) as ei:  # noqa: PT011 - backend=None fails once SQL is reached
-        await export_documents(None, "bank-x", None, memories=_SqlMemories())
+        await export_documents(None, "bank-x", None, memories=PostgresMemories({}))
     assert "list_documents" not in str(ei.value), "a SQL bank must not be read through the store"
 
 
@@ -2390,7 +2779,7 @@ async def test_bank_copy_carries_directives_and_webhooks(memory, request_context
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"INSERT INTO {fq_table('webhooks')} "
+                f"INSERT INTO {fq_store_table('webhooks')} "
                 f"(id, bank_id, url, secret, event_types, enabled, created_at, updated_at) "
                 f"VALUES ($1, $2, $3, NULL, $4, true, NOW(), NOW())",
                 uuid.uuid4(),
@@ -2416,10 +2805,12 @@ async def test_bank_copy_carries_directives_and_webhooks(memory, request_context
         # outcome — the assertions above are what a user sees, this is why they hold.
         async with acquire_with_retry(backend) as conn:
             copied_ids = {
-                r["id"] for r in await conn.fetch(f"SELECT id FROM {fq_table('directives')} WHERE bank_id = $1", target)
+                r["id"]
+                for r in await conn.fetch(f"SELECT id FROM {fq_store_table('directives')} WHERE bank_id = $1", target)
             }
             source_ids = {
-                r["id"] for r in await conn.fetch(f"SELECT id FROM {fq_table('directives')} WHERE bank_id = $1", source)
+                r["id"]
+                for r in await conn.fetch(f"SELECT id FROM {fq_store_table('directives')} WHERE bank_id = $1", source)
             }
         assert copied_ids and not (copied_ids & source_ids)
     finally:
@@ -2501,7 +2892,7 @@ async def test_restored_operations_log_cannot_re_run_the_source_bank_work(memory
         backend = await memory._get_backend()
         async with acquire_with_retry(backend) as conn:
             await conn.execute(
-                f"INSERT INTO {fq_table('async_operations')} "
+                f"INSERT INTO {fq_store_table('async_operations')} "
                 f"(operation_id, bank_id, operation_type, status, task_payload) "
                 f"VALUES ($1, $2, 'retain', 'pending', '{{}}'::jsonb), "
                 f"       ($3, $2, 'retain', 'completed', '{{}}'::jsonb)",
@@ -2517,7 +2908,7 @@ async def test_restored_operations_log_cannot_re_run_the_source_bank_work(memory
             statuses = [
                 r["status"]
                 for r in await conn.fetch(
-                    f"SELECT status FROM {fq_table('async_operations')} WHERE bank_id = $1 AND operation_type = 'retain'",
+                    f"SELECT status FROM {fq_store_table('async_operations')} WHERE bank_id = $1 AND operation_type = 'retain'",
                     target,
                 )
             ]
@@ -2575,7 +2966,7 @@ async def test_attachment_bytes_travel_with_the_bank(memory, request_context):
         async with acquire_with_retry(backend) as conn:
             row = await conn.fetchrow(
                 f"SELECT storage_key, short_id, media_type, document_id, filename "
-                f"FROM {fq_table('attachments')} WHERE bank_id = $1",
+                f"FROM {fq_store_table('attachments')} WHERE bank_id = $1",
                 target,
             )
         assert row is not None
@@ -2732,14 +3123,14 @@ async def test_invalidated_facts_survive_a_bank_copy(memory, request_context):
 
         async with acquire_with_retry(backend) as conn:
             rows = await conn.fetch(
-                f"SELECT id, text, document_id, invalidation_reason FROM {fq_table('invalidated_memory_units')} "
+                f"SELECT id, text, document_id, invalidation_reason FROM {fq_store_table('invalidated_memory_units')} "
                 f"WHERE bank_id = $1",
                 target,
             )
             source_ids = {
                 r["id"]
                 for r in await conn.fetch(
-                    f"SELECT id FROM {fq_table('invalidated_memory_units')} WHERE bank_id = $1", source
+                    f"SELECT id FROM {fq_store_table('invalidated_memory_units')} WHERE bank_id = $1", source
                 )
             }
         assert len(rows) == 1
@@ -2750,7 +3141,7 @@ async def test_invalidated_facts_survive_a_bank_copy(memory, request_context):
 
         async with acquire_with_retry(backend) as conn:
             archived = await get_memories().get_archived_memory(
-                conn=conn, fq_table=fq_table, bank_id=target, unit_id=str(rows[0]["id"])
+                conn=conn, fq_table=fq_store_table, bank_id=target, unit_id=str(rows[0]["id"])
             )
         assert archived is not None and archived.document_id == "doc-1"
         # Fresh unit id: the source row is still there on a same-instance copy.

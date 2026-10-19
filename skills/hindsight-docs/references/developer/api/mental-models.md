@@ -3,7 +3,7 @@
 
 User-curated summaries that provide high-quality, pre-computed answers for common queries.
 
-See [Mental Models](../mental-models) for the concepts behind this API.
+See [Mental Models](../mental-models.md) for the concepts behind this API.
 
 {/* Import raw source files */}
 
@@ -197,17 +197,19 @@ Mental models can be configured to **automatically refresh** when observations a
 | `mode` | `"full"` \| `"delta"` | `"full"` | Refresh strategy. See [Refresh Mode](#refresh-mode) below. |
 | `refresh_after_consolidation` | bool | false | Automatically refresh after observations consolidation |
 | `refresh_cron` | string \| null | null | UTC 5-field cron expression for scheduled refreshes, such as `"0 3 * * *"` for daily at 03:00 UTC |
+| `full_refresh_cron` | string \| null | null | UTC 5-field cron expression for a scheduled **full** refresh of a delta model, such as `"0 3 * * 0"` for Sundays at 03:00 UTC. Works alongside either trigger above. See [Scheduled Full Refresh](#scheduled-full-refresh). |
 | `min_refresh_interval_seconds` | int \| null | null | Minimum seconds between two *automatic* refreshes of this model. See [Rate-limiting automatic refreshes](#rate-limiting-automatic-refreshes) below. `null` uses the bank/global default. |
 | `tags_match` | string \| null | null | How the model's `tags` filter source memories during refresh: `any`, `all`, `any_strict`, `all_strict`, or `exact`. When `null`, a **tagged** model defaults to `all_strict` (a memory must carry every one of the model's tags). Set `"any"` to match memories carrying *any* of the tags — see [Tags and Visibility](#tags-and-visibility). |
-| `tag_groups` | list \| null | null | Advanced boolean tag expressions that override flat `tags`/`tags_match` entirely. See the [Recall tags reference](./recall#tags). |
+| `tag_groups` | list \| null | null | Advanced boolean tag expressions that override flat `tags`/`tags_match` entirely. See the [Recall tags reference](./recall.md#tags). |
 | `fact_types` | list \| null | null | Restrict which fact types the refresh reads: any of `world`, `experience`, `observation`. `null` means all three. Must not be an empty list. |
 | `exclude_mental_models` | bool | false | Hide *all* other mental models from the refresh, so the model never synthesises from sibling models. |
 | `exclude_mental_model_ids` | list \| null | null | Hide specific mental models by ID from the refresh. The model being refreshed is always excluded from itself. |
 | `include_chunks` | bool \| null | null | Override whether the refresh's internal recall returns raw chunk text. `null` uses the bank/global `recall_include_chunks` default. |
 | `recall_max_tokens` | int \| null | null | Override the token budget for facts retrieved during refresh. `null` uses the bank/global default. |
 | `recall_chunks_max_tokens` | int \| null | null | Override the token budget for raw chunks retrieved during refresh. `null` uses the bank/global default. |
-| `reflect_search_observations_max_tokens` | int \| null | null | Override the token budget for the refresh's `search_observations` calls. A smaller budget drops the lowest-ranked observations and shrinks the reflect context. `null` uses the bank's `reflect_default_options`, then the shipped 5000. |
-| `reflect_search_observations_include_entities` | bool \| null | null | Override whether `search_observations` attaches resolved entity names, which can be more than half the tool payload. `null` uses the bank's `reflect_default_options`, then enabled. |
+| `reflect_search_observations_max_tokens` | int \| null | null | Override the token budget for the refresh's `search_observations` calls. A smaller budget drops the lowest-ranked observations and shrinks the reflect context. `null` uses the shipped 5000. A refresh does not read the bank's `reflect_default_options`. |
+| `reflect_search_observations_include_entities` | bool \| null | null | Override whether `search_observations` attaches resolved entity names, which can be more than half the tool payload. `null` means enabled. A refresh does not read the bank's `reflect_default_options`. |
+| `budget` | string \| null | null | How many agent steps a refresh may spend, as a multiple of the server's `reflect_max_iterations`: `low` halves it, `mid` keeps it, `high` doubles it. `null` means `mid` — a refresh writes a whole document, so it does not inherit the `low` an ad-hoc reflect defaults to. |
 | `response_schema` | object \| null | null | JSON Schema for structured output. When set, each refresh also stores a `structured_output` alongside the markdown content. See [Structured Output](#structured-output) below. |
 | `keep_trace` | bool | false | Record how each refresh reached its result under `reflect_response.trace`. See [Troubleshoot a Refresh](#troubleshoot-a-refresh). |
 
@@ -217,7 +219,7 @@ When `refresh_cron` is set, Hindsight checks the schedule on the server's mental
 
 `last_refresh_failed_at` on the model (and on a page in the knowledge tree) carries when that happened, so a list view can show which models have stopped refreshing themselves without reading each one's history.
 
-**A failed refresh pauses the automatic ones.** A failed refresh is retried by the worker (`HINDSIGHT_API_WORKER_MAX_RETRIES`, 3 by default) and then stops. Neither `refresh_after_consolidation` nor `refresh_cron` queues that model again until a refresh succeeds, so a refresh that cannot work (a prompt too large for the model, an empty account, a delta that will not apply) costs a few attempts instead of an LLM bill every tick. The failure shows in the model's [history](#history). Fix the cause and refresh the model yourself: a successful refresh resumes the automatic ones. A refresh cut off by `HINDSIGHT_API_REFLECT_WALL_TIMEOUT`, which bounds a whole refresh the same way it bounds a reflect, counts as a failure too.
+**A failed refresh pauses the automatic ones.** A failed refresh is retried by the worker (`HINDSIGHT_API_WORKER_MAX_RETRIES`, 3 by default) and then stops. None of `refresh_after_consolidation`, `refresh_cron` or `full_refresh_cron` queues that model again until a refresh succeeds, so a refresh that cannot work (a prompt too large for the model, an empty account, a delta that will not apply) costs a few attempts instead of an LLM bill every tick. The failure shows in the model's [history](#history). Fix the cause and refresh the model yourself: a successful refresh resumes the automatic ones. A refresh cut off by `HINDSIGHT_API_REFLECT_WALL_TIMEOUT`, which bounds a whole refresh the same way it bounds a reflect, counts as a failure too.
 
 ### Rate-limiting automatic refreshes
 
@@ -243,8 +245,8 @@ queued refresh — so a burst of twenty retains costs one refresh, and that refr
 reads everything the twenty retains added. The only thing you trade away is immediacy: the
 model can lag its memories by up to the interval.
 
-The floor applies to both automatic triggers (`refresh_after_consolidation` and
-`refresh_cron`). It never applies to a refresh you ask for — the refresh endpoint, the MCP
+The floor applies to every automatic trigger (`refresh_after_consolidation`,
+`refresh_cron` and `full_refresh_cron`). It never applies to a refresh you ask for — the refresh endpoint, the MCP
 tool, and the control plane's refresh button all run immediately, and additionally release a
 parked refresh if one is waiting.
 
@@ -281,13 +283,15 @@ Key behaviours:
 - **Fails loudly.** If a `response_schema` is configured but the structured extraction cannot be produced, the refresh **fails** rather than silently persisting content with no structured view. The model's previous content and `structured_output` are preserved, and the refresh can be retried.
 - **Invalid schemas are rejected** at request time: the schema must be an object with at least one property, and each property's `type` must be one of `string`, `number`, `integer`, `boolean`, `array`, or `object`.
 
-See [Reflect → `response_schema`](./reflect#response_schema) for how the same schema works on the `reflect` endpoint. The `structured_output` value appears on the model's `reflect_response` (see [Response Fields](#response-fields)).
+See [Reflect → `response_schema`](./reflect.md#response_schema) for how the same schema works on the `reflect` endpoint. The `structured_output` value appears on the model's `reflect_response` (see [Response Fields](#response-fields)).
 
 ### Staleness Gating
 
 Both automatic triggers run the same check before spending an LLM call: **is there a memory in this model's resolved scope newer than its last refresh?** The model's `tags`/`tags_match`, `tag_groups`, and `fact_types` all apply to that check, so activity elsewhere in the bank does not trigger a rebuild, and a cron tick over an unchanged scope is skipped entirely. Memories still waiting to be consolidated count — they are already stored, so a model whose scope reaches them is considered stale.
 
-Every `is_stale` you can read is computed by that same rule: the flag on a single mental-model read, the one on the list, the one surfaced to the reflect agent, and the per-page flag on the [knowledge-base tree](./knowledge-pages). A model flagged stale is one a refresh would actually rewrite.
+**Untagged writes never make a tagged model stale.** Under `tags_match: "any"` or `"all"` a refresh also *reads* untagged memories, but staleness only counts writes that carry the model's tags. Otherwise, on a bank that mixes tagged and untagged writes, every such model would read stale after nearly every write (#4857). The same goes for `tag_groups` leaves using those modes; a group that selects untagged memories explicitly (an `exact` leaf with no tags, or a `not`) still counts them. A model with no tags has the whole bank as its scope, so any write marks it stale.
+
+Every `is_stale` you can read is computed by that same rule: the flag on a single mental-model read, the one on the list, the one surfaced to the reflect agent, and the per-page flag on the [knowledge-base tree](./knowledge-pages.md). A model flagged stale is one a refresh would actually rewrite.
 
 Listing does not cost one query per model — the whole page is answered together — so you do not have to approximate. If you are already holding `last_memory_write_at` from the bank stats endpoint, a model whose `last_memory_seen_at` is at or after it is provably up to date without asking at all: nothing in the bank changed, so nothing in that model's scope did.
 
@@ -414,6 +418,41 @@ result2, _, _ := client.MentalModelsAPI.CreateMentalModel(ctx, mmBankID).
 // This mental model will automatically refresh when observations are updated
 fmt.Printf("Operation ID: %s\n", result2.GetOperationId())
 ```
+
+### Scheduled Full Refresh
+
+A `delta` model keeps unchanged sections byte-for-byte, which is the point — but over months
+of small edits a document can drift from what a fresh write would say: wording shaped by
+increments, sections that are hard to retire. `full_refresh_cron` adds a second, independent
+schedule on which the model is refreshed in **full** mode, while every other refresh stays
+`delta`:
+
+```json
+{
+  "trigger": {
+    "mode": "delta",
+    "refresh_after_consolidation": true,
+    "min_refresh_interval_seconds": 21600,
+    "full_refresh_cron": "0 3 * * 0"
+  }
+}
+```
+
+This model is edited in place after each consolidation (at most every 6 hours), and rewritten
+from scratch every Sunday at 03:00 UTC. Afterwards it carries on in `delta` mode — the
+schedule never changes `mode`.
+
+- **Independent of the other triggers.** It combines with `refresh_after_consolidation` or
+  with `refresh_cron`. If both crons are due on the same check, one refresh runs, in full mode.
+- **Its own clock.** It comes due against `last_full_refreshed_at`, not `last_refreshed_at`,
+  so frequent delta refreshes never push it back.
+- **Skipped when there is nothing to fix.** If no refresh ran since the last full one, the
+  tick is skipped. Unlike `refresh_cron` it is not gated on new memories: drift left by past
+  edits is still there on a quiet bank.
+- **Same safety as any automatic refresh.** It honours `min_refresh_interval_seconds`, pauses
+  while the last refresh failed, and a full refresh that fails keeps the current content.
+
+To run one full refresh now, send `{"mode": "full"}` to the [refresh endpoint](#refresh-a-mental-model).
 
 ### When to Use Automatic Refresh
 
@@ -609,6 +648,7 @@ The List endpoint previously defaulted to `full`. A caller that omits `detail` a
 | `tags` | list | metadata | Tags for filtering |
 | `last_refreshed_at` | string | metadata | When a refresh last finished — wall-clock. Advances on every completed refresh, including one that found nothing new. Answers "have I already refreshed this?" |
 | `last_memory_seen_at` | string | metadata | The newest in-scope memory the last refresh saw. Answers "is this behind the data?" — compare against `last_memory_write_at` from the stats endpoint |
+| `last_full_refreshed_at` | string \| null | metadata | When a refresh last ran in full mode — asked for, scheduled, or a delta that fell back to full. `full_refresh_cron` comes due against this |
 | `created_at` | string | metadata | When the mental model was created |
 | `source_query` | string | content | The query used to generate content |
 | `content` | string | content | The generated mental model text |
@@ -664,12 +704,60 @@ Refreshing is useful when:
 - Observations have been updated
 - You want to ensure the mental model reflects current knowledge
 
+**Full refresh on demand.** Send `{"mode": "full"}` as the body to rewrite the content from
+scratch this once, whatever the model's `mode`. The model keeps its mode — a `delta` model
+goes back to editing in place on its next refresh. Use it to clear the drift a `delta` model
+builds up over many edits; to do it on a schedule, set
+[`full_refresh_cron`](#scheduled-full-refresh).
+
+### Python
+
+```python
+# Rewrite the content from scratch this once; the model keeps its mode
+result = client.refresh_mental_model(
+    bank_id=BANK_ID,
+    mental_model_id=mental_model_id,
+    mode="full",
+)
+
+print(f"Full refresh operation ID: {result.operation_id}")
+```
+
+### Node.js
+
+```javascript
+// Rewrite the content from scratch this once; the model keeps its mode
+const fullResult = await client.refreshMentalModel(BANK_ID, mentalModelId, { mode: "full" });
+
+console.log(`Full refresh operation ID: ${fullResult.operation_id}`);
+```
+
+### CLI
+
+```bash
+# Rewrite the content from scratch this once; the model keeps its mode
+hindsight mental-model refresh "$BANK_ID" "$MENTAL_MODEL_ID" --full
+```
+
+### Go
+
+```go
+// Rewrite the content from scratch this once; the model keeps its mode
+fullReq := hindsight.NewRefreshMentalModelRequest()
+fullReq.SetMode("full")
+fullResult, _, _ := client.MentalModelsAPI.RefreshMentalModel(ctx, mmBankID, mentalModelID).
+	RefreshMentalModelRequest(*fullReq).Execute()
+
+fmt.Printf("Full refresh operation ID: %s\n", fullResult.GetOperationId())
+```
+
 **Refreshes coalesce.** A model has at most one refresh waiting at a time: if one is
 already queued and has not started yet, this call returns *that* operation instead of
 queueing an identical second one — the queued refresh reads the model as it stands when
 it runs, so it already covers what you just asked for. Poll the returned `operation_id`
 as usual. A refresh that is already *running* is not reused: it may have read the model
-before your latest change, so a new operation is queued behind it.
+before your latest change, so a new operation is queued behind it. A full refresh that joins
+a queued plain one turns that one into a full refresh.
 
 **And they run one at a time.** A model's refreshes never overlap: the operation queued
 behind a running one starts when that one finishes, so the model is written by one refresh
@@ -763,7 +851,7 @@ and takes the same time. It is validated and billed like a refresh.
 ### Keep traces: record every refresh as it happens
 
 A dry run only explains a refresh you run yourself. Refreshes driven by
-`refresh_after_consolidation` or `refresh_cron` happen with nobody watching, and by
+`refresh_after_consolidation`, `refresh_cron` or `full_refresh_cron` happen with nobody watching, and by
 the time you notice a bad document, the run that produced it is gone.
 
 Setting `trigger.keep_trace` records the same reasoning on every refresh of that
@@ -822,7 +910,7 @@ behind to inspect.
 
 #### What a trace contains
 
-The trace is deliberately shaped like a [reflect](./reflect) trace: the calls the
+The trace is deliberately shaped like a [reflect](./reflect.md) trace: the calls the
 agent made, plus the decision specific to a refresh. It is stored on the mental
 model row and re-read on every fetch, so it holds nothing that can be derived from
 somewhere else.
@@ -843,7 +931,7 @@ somewhere else.
 - **Tool outputs.** Only `result_count` is kept. Recall payloads are large and the
   trace is re-read on every model fetch, so storing them would grow the row without
   bound. A count is enough to see *that* a tool came back empty; when you need the
-  raw prompts and responses, use [LLM request tracing](../monitoring), which stores
+  raw prompts and responses, use [LLM request tracing](../monitoring.md), which stores
   them separately and expires them on its own retention schedule.
 - **The evidence.** The facts a refresh grounded the document on already live in
   `reflect_response.based_on`, in the same shape reflect uses. The trace does not
@@ -919,7 +1007,9 @@ The clear operation is synchronous and resets the content to an empty string. Th
 
 > **💡 Tip**
 >
-For long-lived delta-mode mental models, consider scheduling a periodic clear + refresh (e.g. every 48 hours) to keep the content accurate while still benefiting from incremental delta updates in between.
+To clear a delta model's drift, prefer a [full refresh](#refresh-a-mental-model) (`{"mode": "full"}`), or set
+[`full_refresh_cron`](#scheduled-full-refresh) to do it on a schedule. Unlike clearing first,
+a full refresh that fails leaves the current content in place.
 ---
 
 ## Update a Mental Model
@@ -1115,13 +1205,13 @@ result3, _, _ := client.MentalModelsAPI.CreateMentalModel(ctx, mmBankID).
 fmt.Printf("Operation ID: %s\n", result3.GetOperationId())
 ```
 
-The MCP `create_mental_model` tool exposes the same option as a top-level `tags_match` argument. Available modes are `any`, `all`, `any_strict`, `all_strict`, and `exact` — see the [Recall tags reference](./recall#tags) for their exact semantics.
+The MCP `create_mental_model` tool exposes the same option as a top-level `tags_match` argument. Available modes are `any`, `all`, `any_strict`, `all_strict`, and `exact` — see the [Recall tags reference](./recall.md#tags) for their exact semantics.
 
 ### How tags affect mental model lookup during reflect
 
 When you call `reflect` with tags, those same tags are used to filter which mental models the agent can see. A mental model is visible only if its tags overlap with the tags on the reflect request.
 
-For more details on tag matching modes (`any`, `any_strict`, `all`, `all_strict`) and worked examples, see the [Recall tags reference](./recall#tags).
+For more details on tag matching modes (`any`, `any_strict`, `all`, `all_strict`) and worked examples, see the [Recall tags reference](./recall.md#tags).
 
 ### Listing mental model tags
 
@@ -1224,6 +1314,6 @@ History tracking is enabled by default. Set `HINDSIGHT_API_ENABLE_MENTAL_MODEL_H
 
 ## Next Steps
 
-- [**Reflect**](./reflect) — How the agentic loop uses mental models
+- [**Reflect**](./reflect.md) — How the agentic loop uses mental models
 - [**Observations**](../observations.md) — How knowledge is consolidated
-- [**Operations**](./operations) — Track async mental model creation
+- [**Operations**](./operations.md) — Track async mental model creation
