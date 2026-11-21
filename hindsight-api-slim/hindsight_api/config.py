@@ -468,6 +468,8 @@ ENV_CONSOLIDATION_LLM_MAX_CONCURRENT = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONC
 # batch-shaped workload too. The batch host needs no extra wiring: the per-role base
 # URL is derived generically (see ENV_LLM_BATCH_BASE_URL), so the global one covers it.
 ENV_CONSOLIDATION_BATCH_ENABLED = "HINDSIGHT_API_CONSOLIDATION_BATCH_ENABLED"
+ENV_CONSOLIDATION_SKIP_SESSION_INGEST = "HINDSIGHT_API_CONSOLIDATION_SKIP_SESSION_INGEST"
+ENV_RECALL_SKIP_SESSION_INGEST = "HINDSIGHT_API_RECALL_SKIP_SESSION_INGEST"
 ENV_CONSOLIDATION_BATCH_POLL_INTERVAL_SECONDS = "HINDSIGHT_API_CONSOLIDATION_BATCH_POLL_INTERVAL_SECONDS"
 ENV_CONSOLIDATION_LLM_MAX_RETRIES = "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_RETRIES"
 ENV_CONSOLIDATION_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_CONSOLIDATION_LLM_INITIAL_BACKOFF"
@@ -1889,6 +1891,12 @@ DEFAULT_CONSOLIDATION_BATCH_POLL_INTERVAL_SECONDS = DEFAULT_RETAIN_BATCH_POLL_IN
 # entities are respected). Enabled by default; set to 1.0 to disable. Postgres only — the merge
 # path uses Postgres-only SQL, so consolidation skips it on Oracle regardless of this value.
 DEFAULT_CONSOLIDATION_DEDUP_THRESHOLD = 0.97
+# Skip session_ingest memories (raw terminal commands, file listings etc. from session
+# transcripts) at consolidation time. They are noise for consolidation — the LLM can't
+# do anything useful with 500 copies of "The assistant ran `cd /some/path && ls`".
+# Memories are marked consolidated so they don't accumulate as sticky failures.
+DEFAULT_CONSOLIDATION_SKIP_SESSION_INGEST = True
+DEFAULT_RECALL_SKIP_SESSION_INGEST = True
 DEFAULT_CONSOLIDATION_LLM_PARALLELISM = (
     4  # Max tag groups consolidated concurrently per op. Locks on overlapping write
     # scopes degrade to sequential automatically; matches retain_max_concurrent.
@@ -3641,6 +3649,8 @@ class HindsightConfig:
     knowledge_page_default_trigger: dict | None
     consolidation_batch_size: int
     consolidation_batch_enabled: bool
+    consolidation_skip_session_ingest: bool
+    recall_skip_session_ingest: bool
     consolidation_batch_poll_interval_seconds: int
     consolidation_dedup_threshold: float
     consolidation_max_memories_per_round: int
@@ -5359,6 +5369,16 @@ class HindsightConfig:
             ),
             consolidation_batch_enabled=os.getenv(
                 ENV_CONSOLIDATION_BATCH_ENABLED, str(DEFAULT_CONSOLIDATION_BATCH_ENABLED)
+            ).lower()
+            == "true",
+            consolidation_skip_session_ingest=os.getenv(
+                ENV_CONSOLIDATION_SKIP_SESSION_INGEST,
+                str(DEFAULT_CONSOLIDATION_SKIP_SESSION_INGEST),
+            ).lower()
+            == "true",
+            recall_skip_session_ingest=os.getenv(
+                ENV_RECALL_SKIP_SESSION_INGEST,
+                str(DEFAULT_RECALL_SKIP_SESSION_INGEST),
             ).lower()
             == "true",
             consolidation_batch_poll_interval_seconds=int(

@@ -163,6 +163,16 @@ async def retrieve_semantic_bm25_combined_sql(
         updated_range_clause += f" AND updated_at < ${_next_idx}"
         _next_idx += 1
 
+    # --- session_ingest filter (tool-output bulk: raw terminal commands, file listings etc.) ---
+    # These memories are low-value noise in recall context. They are already skipped at
+    # consolidation; skip them at retrieval too so they don't inflate prompt tokens.
+    kind_blacklist_clause = ""
+    if getattr(config, "recall_skip_session_ingest", False):
+        kind_blacklist_clause = " AND metadata->>'kind' != 'session_ingest'"
+
+    # Combine with extra_where suffix for semantic arms (appended to the arm's WHERE)
+    semantic_extra = updated_range_clause + kind_blacklist_clause
+
     # --- Semantic UNION ALL arms (one per fact_type) ---
     # Each arm has its own ORDER BY ... LIMIT, enabling the partial HNSW indexes
     # per fact_type instead of forcing a full sequential scan.
@@ -177,7 +187,7 @@ async def retrieve_semantic_bm25_combined_sql(
             min_similarity=sem_min,
             tags_clause=tags_clause,
             groups_clause=groups_clause,
-            extra_where=updated_range_clause,
+            extra_where=semantic_extra,
         )
         for ft in fact_types
     ]
@@ -214,7 +224,7 @@ async def retrieve_semantic_bm25_combined_sql(
                     pg_search_function_schema=config.text_search_extension_pg_search_function_schema,
                     pg_search_tokenizer=config.text_search_extension_pg_search_tokenizer,
                     max_query_terms=config.bm25_max_query_terms,
-                    extra_where=updated_range_clause,
+                    extra_where=semantic_extra,
                 )
             )
 
@@ -411,6 +421,13 @@ async def retrieve_temporal_combined_sql(
     if end_date.tzinfo is None:
         end_date = end_date.replace(tzinfo=UTC)
 
+    config = get_config()
+
+    # --- session_ingest filter ---
+    kind_blacklist_clause = ""
+    if getattr(config, "recall_skip_session_ingest", False):
+        kind_blacklist_clause = " AND metadata->>'kind' != 'session_ingest'"
+
     # Build tags clause
     # Entry-point query: fixed params are $1-$5 (emb, bank, start, end, threshold), tags at $6.
     # fact_type is inlined as a literal per UNION ALL arm (not a bind) — this avoids `unnest`,
@@ -495,6 +512,7 @@ async def retrieve_temporal_combined_sql(
           {tags_clause}
           {groups_clause}
           {updated_range_clause}
+          {kind_blacklist_clause}
         ORDER BY embedding <=> $1::vector
         LIMIT {_TEMPORAL_POOL_SIZE}
         )"""

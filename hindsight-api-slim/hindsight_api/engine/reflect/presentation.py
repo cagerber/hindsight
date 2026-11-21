@@ -1,35 +1,28 @@
 """How a retrieval tool's result is written into the reflect prompt.
 
 The tools return the full serialized records; this decides what the MODEL reads.
-Measured on the refresh-cost eval, the fact text was a fifth of the synthesis
-prompt. The rest was the frame around it: a 36-character UUID per item, full
-ISO timestamps to the microsecond, a ``fact_type`` that is the same on every
-item of a list, chunk keys built from the bank id plus a document UUID, and
-items the model had already been shown by an earlier search. Every one of those
-is re-sent on every later turn of the loop.
 
-So, per reflect:
+MAX_STRING_CHARS: Tool result strings longer than this are truncated before being
+rendered into the reflect prompt. Read-only tools (skill_view, read_file,
+browser_console, terminal) routinely return 50–85 KB of raw output that is
+useless for reasoning — an LLM does not need the full SKILL.md to answer
+"what does this skill do". The truncation note preserves the original size so
+the model sees the scale of the output without processing it token-for-token.
 
 * ids become short aliases (``f1`` fact, ``o1`` observation, ``p1`` page,
-  ``c1`` chunk), and every alias the model writes back — in ``done``, in
-  ``expand``, and in the answer text itself — is resolved to the real id before
-  anything reads it. The aliases mean nothing outside this one reflect, so none
-  may reach the caller or a stored mental model (#4876). The API trace keeps the
-  raw output; only the prompt is shortened.
-* a full UUID in the final answer that the model was never shown — not a
-  retrieved id, not in any tool result, not in its prompt — was made up or
-  garbled (by the model or by the length rewrite), so it is replaced before it
-  can pose as a citation (#5166). A UUID the model did read, a request id
-  quoted in a memory say, passes untouched.
+  ``c1`` chunk), and every alias the model writes back is resolved to the real
+  id before anything reads it. The aliases mean nothing outside this one
+  reflect, so none may reach the caller or a stored mental model (#4876).
+* a full UUID in the final answer that the model was never shown is replaced
+  before it can pose as a citation (#5166). A UUID the model did read passes
+  untouched.
 * timestamps keep their minute (``2026-03-07 12:00``), dropping seconds,
-  microseconds and the UTC offset (they are all UTC). Dates are evidence:
-  supersession is decided by them, so they are shortened, never dropped.
+  microseconds and the UTC offset (they are all UTC).
 * ``occurred_end`` is dropped when it equals ``occurred_start``; a list's
-  constant ``fact_type`` (every observation is an observation) is dropped.
+  constant ``fact_type`` is dropped.
 * chunk ``chunk_index`` is dropped, and ``truncated`` kept only when true.
 * an item already shown earlier in this reflect is listed by alias under
-  ``already_shown`` instead of being written out again: the model has it, and
-  that a later search matched it too is still said.
+  ``already_shown`` instead of being written out again.
 """
 
 from __future__ import annotations
@@ -37,6 +30,11 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+
+#: Maximum character length for a string value in a presented tool result.
+#: Strings longer than this are replaced with a truncated prefix so the reflect
+#: prompt does not balloon to 100+ KB when a read_file returns a 70 KB file.
+_MAX_STRING_CHARS = 500
 
 _ALIAS_RE = re.compile(r"^[fopc]\d+$")
 _ALIAS_IN_TEXT_RE = re.compile(r"\b[fopc]\d+\b")
@@ -166,6 +164,12 @@ class ToolResultPresenter:
                 }
             elif key == "count":
                 continue  # the length of the list right below it
+            elif isinstance(value, str) and len(value) > _MAX_STRING_CHARS:
+                # Raw output from read-only tools (skill_view, read_file, browser_console,
+                # terminal) is summarized rather than passed in full.  An 85 KB SKILL.md
+                # or a 70 KB file content serves no purpose in a reflect prompt — the model
+                # needs "it returned a 50 KB Python file" not the bytes themselves.
+                out[key] = value[:_MAX_STRING_CHARS] + f" [TRUNCATED, {len(value)} total chars]"
             else:
                 out[key] = value
         if shown:

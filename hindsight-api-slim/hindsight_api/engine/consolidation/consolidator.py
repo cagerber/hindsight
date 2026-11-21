@@ -1516,6 +1516,7 @@ async def run_consolidation_job(
     operation_id: str | None = None,
     observation_scopes: list[list[str]] | None = None,
     pending_refresh_tags: list[str] | None = None,
+    use_batch: bool = False,
 ) -> dict[str, Any]:
     """
     Run consolidation job for a bank.
@@ -1533,12 +1534,19 @@ async def run_consolidation_job(
         pending_refresh_tags: Tags of memories consolidated by earlier rounds of this
             round-limited chain, carried through the re-queue so the final round can
             refresh every affected mental model exactly once (#3411).
+        use_batch: When True, submit all consolidation LLM calls as one batch to the
+            xiaomimimo Batch API instead of calling the LLM synchronously. Requires
+            ``HINDSIGHT_API_CONSOLIDATION_BATCH_ENABLED=true``.
 
     Returns:
         Dict with consolidation results
     """
     # Resolve bank-specific config with hierarchical overrides
     config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
+
+    # Auto-enable batch path if the feature flag is set
+    if getattr(config, "consolidation_batch_enabled", False):
+        use_batch = True
 
     # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
     # to every call without leaking across operations.
@@ -1551,6 +1559,22 @@ async def run_consolidation_job(
     trace_ctx = trace_context_of(llm_config)
     trace_token = set_trace_context(trace_ctx) if trace_ctx is not None else None
     try:
+        # Route to batch path if consolidation batch is enabled and use_batch is requested
+        if use_batch and getattr(config, "consolidation_batch_enabled", False):
+            # Import here to avoid circular imports
+            from ._batch_consolidation import run_consolidation_job_batch
+
+            logger.info(f"[CONSOLIDATION] bank={bank_id} using batch consolidation")
+            return await run_consolidation_job_batch(
+                memory_engine,
+                bank_id,
+                request_context,
+                config,
+                llm_config,
+                operation_id,
+                observation_scopes,
+            )
+
         return await _run_consolidation_job(
             memory_engine,
             bank_id,
@@ -1560,6 +1584,7 @@ async def run_consolidation_job(
             operation_id,
             observation_scopes,
             pending_refresh_tags,
+            use_batch=use_batch,
         )
     finally:
         if trace_token is not None:
@@ -1578,6 +1603,8 @@ async def _run_consolidation_job(
     operation_id: str | None = None,
     observation_scopes: list[list[str]] | None = None,
     pending_refresh_tags: list[str] | None = None,
+    *,
+    use_batch: bool = False,
 ) -> dict[str, Any]:
     """Core consolidation flow. See ``run_consolidation_job`` for the public entrypoint."""
     perf = ConsolidationPerfLog(bank_id)
@@ -1706,8 +1733,42 @@ async def _run_consolidation_job(
             )
             perf.record_timing("fetch_memories", time.perf_counter() - t0)
 
-        if not memories:
-            break  # No more unconsolidated memories
+            if not memories:
+                break  # No more unconsolidated memories
+
+            # Filter session_ingest memories if configured to skip them.
+            # These are raw terminal commands / file listings from session transcripts — they are
+            # consolidation noise (hundreds of "The assistant ran `cd /path && ls`" facts that
+            # the LLM can't do anything useful with). Mark them consolidated and exclude
+            # them from the LLM batch.
+            if getattr(config, "consolidation_skip_session_ingest", False):
+                session_ingest_memories = []
+                non_session_ingest_memories = []
+                for m in memories:
+                    if m.get("metadata", {}).get("kind") == "session_ingest":
+                        session_ingest_memories.append(m)
+                    else:
+                        non_session_ingest_memories.append(m)
+
+                if session_ingest_memories:
+                    logger.info(
+                        f"[CONSOLIDATION] bank={bank_id} skipping {len(session_ingest_memories)} "
+                        f"session_ingest memories (marked consolidated, no LLM call)"
+                    )
+                    await get_memories().mark_consolidated(
+                        conn=conn,
+                        fq_table=fq_table,
+                        bank_id=bank_id,
+                        unit_ids=[str(m["id"]) for m in session_ingest_memories],
+                        when=datetime.now(timezone.utc),
+                        failed=False,
+                    )
+                    cumulative_progress["processed"] += len(session_ingest_memories)
+
+                if not non_session_ingest_memories:
+                    continue  # Fetch next batch
+
+                memories = non_session_ingest_memories
 
         # Group memories by target observation scope before batching — security
         # requirement: memories targeting different scopes must never share an
@@ -2397,6 +2458,7 @@ async def _process_memory_batch(
     config: Any = None,
     obs_tags_override: list[str] | None = None,
     mark_consolidated_ids: list[Any] | None = None,
+    precomputed_llm_result: _BatchLLMResult | None = None,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """
     Process a batch of memories in a single LLM call.
@@ -2511,21 +2573,25 @@ async def _process_memory_batch(
         )
     llm_memories = [m for m in memories if not triage.settled(str(m["id"]))]
 
-    # 3. Single LLM call — skipped when triage settled every fact.
+    # 3. Single LLM call — skipped when triage settled every fact or a precomputed
+    # result is provided (batch consolidation path: LLM was called via Batch API).
     t0 = time.perf_counter()
-    llm_result = (
-        await _consolidate_batch_with_llm(
-            llm_config=llm_config,
-            memories=llm_memories,
-            union_observations=union_observations,
-            union_source_facts=union_source_facts,
-            config=config,
-            remaining_observation_slots=remaining_observation_slots,
-            max_observations_per_scope=max_obs,
+    if precomputed_llm_result is not None:
+        llm_result = precomputed_llm_result
+    else:
+        llm_result = (
+            await _consolidate_batch_with_llm(
+                llm_config=llm_config,
+                memories=llm_memories,
+                union_observations=union_observations,
+                union_source_facts=union_source_facts,
+                config=config,
+                remaining_observation_slots=remaining_observation_slots,
+                max_observations_per_scope=max_obs,
+            )
+            if llm_memories
+            else _BatchLLMResult()
         )
-        if llm_memories
-        else _BatchLLMResult()
-    )
     if perf and llm_memories:
         perf.record_timing("llm", time.perf_counter() - t0)
         perf.record_llm_call(llm_result.obs_count, llm_result.prompt_chars)
@@ -3519,8 +3585,19 @@ async def _consolidate_batch_with_llm(
     config: Any,
     remaining_observation_slots: int | None = None,
     max_observations_per_scope: int = -1,
+    *,
+    precomputed_result: "_BatchLLMResult | None" = None,
 ) -> _BatchLLMResult:
-    """Single LLM call for a batch of facts against a pooled set of observations."""
+    """Single LLM call for a batch of facts against a pooled set of observations.
+
+    When ``precomputed_result`` is provided (batch consolidation path), the LLM call
+    is skipped and the pre-computed result is returned directly. This allows the
+    batch consolidation path to submit many consolidation LLM calls as one batch to
+    the xiaomimimo Batch API, then re-inject the parsed results into the same
+    result-application logic that the sync path uses.
+    """
+    if precomputed_result is not None:
+        return precomputed_result
     if config is None:
         raise ValueError("config is required for _consolidate_batch_with_llm")
     if union_observations:

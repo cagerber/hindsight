@@ -3012,6 +3012,7 @@ class MemoryEngine(MemoryEngineInterface):
             gemini_service_tier=config.llm_gemini_service_tier,
             groq_service_tier=config.llm_groq_service_tier,
             openai_service_tier=config.llm_openai_service_tier,
+            batch_base_url=config.llm_batch_base_url,
             gemini_safety_settings=_llm_gemini_safety_settings,
             prompt_cache_enabled=config.llm_prompt_cache_enabled,
             codex_home=config.llm_codex_home,
