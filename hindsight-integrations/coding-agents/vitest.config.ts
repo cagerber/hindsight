@@ -20,6 +20,9 @@ export default defineConfig({
       // than with vi.stubEnv in a test: config.ts captures the path in a module-level constant, so
       // by the time a test body runs the value is already fixed. Points at a path with no file.
       HINDSIGHT_CONFIG: join(tmpdir(), "hindsight-coding-agent-test-absent.json"),
+      // Retain cursors default to ~/.hindsight/state/cursors; keep tests' cursors in the temp dir
+      // so they can neither litter nor read a developer's live session state.
+      HINDSIGHT_CURSOR_DIR: join(tmpdir(), "hindsight-plugin-test-cursors"),
     },
   },
 });
