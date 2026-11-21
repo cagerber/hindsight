@@ -272,6 +272,38 @@ describe("retainLiveSession — incremental write-back", () => {
     expect(cursors.read("s1")?.ops).toEqual([opOf(2), opOf(3)]);
   });
 
+  it("asks the server to retry a failed op instead of replacing the whole transcript", async () => {
+    const status = new Map<string, string>();
+    const retries: string[] = [];
+    const { retain, client } = stubClient();
+    Object.assign(client, {
+      bankUrl: (s: string) => s,
+      req: vi.fn(async (method: string, url: string) => {
+        const parts = url.split("/");
+        if (method === "POST" && parts.pop() === "retry") {
+          retries.push(parts.pop()!);
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }
+        const st = status.get(url.split("/").pop()!);
+        return new Response(JSON.stringify({ status: st }), { status: st ? 200 : 404 });
+      }),
+    });
+    const cursors = memoryCursorStore();
+    const opOf = (call: number) => retain.mock.calls[call][5].operationId as string;
+
+    await write(client, turns(2), cursors);
+    status.set(opOf(0), "completed");
+    await write(client, turns(3), cursors);
+    status.set(opOf(1), "failed");
+    await write(client, turns(4), cursors);
+
+    // The failed op was re-queued server-side with its own payload, so this write-back only appends
+    // the one new turn — and the retried op stays tracked until it is seen to complete.
+    expect(retries).toEqual([opOf(1)]);
+    expect(retain.mock.calls[2][5].updateMode).toBe("append");
+    expect(cursors.read("s1")?.ops).toEqual([opOf(1), opOf(2)]);
+  });
+
   it("replaces on the first write, then appends only the new turns", async () => {
     const { retain, client } = stubClient();
     const cursors = memoryCursorStore();
