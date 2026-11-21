@@ -488,12 +488,18 @@ async def mark_consolidated(
     ids = _as_uuids(unit_ids)
     if not ids:
         return
-    column = "consolidation_failed_at" if failed else "consolidated_at"
+    # A success stamp (or a requeue clear) also clears consolidation_failed_at, so a
+    # memory that failed once is not kept out of the queue after it later succeeds.
+    # A failure stamp leaves consolidated_at alone.
+    if failed:
+        set_clause = "consolidation_failed_at = $1"
+    else:
+        set_clause = "consolidated_at = $1, consolidation_failed_at = NULL"
     guard = "" if when is not None else " AND fact_type IN ('experience', 'world')"
     await conn.execute(
         f"""
         UPDATE {fq_table("memory_units")}
-        SET {column} = $1
+        SET {set_clause}
         WHERE bank_id = $2 AND id = ANY($3::uuid[]){guard}
         """,
         when,
