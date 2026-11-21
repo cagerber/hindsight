@@ -57,6 +57,12 @@ _LISTS = {"memories": "f", "observations": "o", "mental_models": "p"}
 #: A list's constant type field, dropped because the list key already says it.
 _CONSTANT_TYPE = {"observations": "observation"}
 
+#: Longest top-level string a presented tool result keeps. Read-only tools
+#: (skill_view, read_file, browser_console, terminal) return 50-85 KB of raw
+#: output; the reflect prompt needs its size, not its bytes. List items
+#: (memories, observations, mental models) are never cut.
+_MAX_STRING_CHARS = 500
+
 
 def compact_timestamp(value: Any) -> Any:
     """``2026-03-07T12:00:00.123+00:00`` -> ``2026-03-07 12:00``; other values unchanged."""
@@ -178,6 +184,8 @@ class ToolResultPresenter:
                 }
             elif key == "count":
                 continue  # the length of the list right below it
+            elif isinstance(value, str) and len(value) > _MAX_STRING_CHARS:
+                out[key] = value[:_MAX_STRING_CHARS] + f" [TRUNCATED, {len(value)} total chars]"
             else:
                 out[key] = value
         if shown:

@@ -182,3 +182,16 @@ def test_drop_unseen_ids_keeps_only_uuids_the_model_read():
 
     text = f"{seen.upper()} 11111111-2222-4333-8444-555555555555 3f2a9c1e-0000-4e6f-8a1b-2c3d4e5f6a7b"
     assert presenter.drop_unseen_ids(text) == f"{seen.upper()} 11111111-2222-4333-8444-555555555555 [unverified id]"
+
+
+def test_long_top_level_string_is_truncated_but_items_are_not():
+    p = ToolResultPresenter()
+    out = p.present({"content": "x" * 2000, "memories": [{"id": "11111111-1111-1111-1111-111111111111", "text": "y" * 900}]})
+    assert out["content"].startswith("x" * 500)
+    assert out["content"].endswith("[TRUNCATED, 2000 total chars]")
+    assert out["memories"][0]["text"] == "y" * 900
+
+
+def test_short_top_level_string_is_untouched():
+    p = ToolResultPresenter()
+    assert p.present({"content": "short"})["content"] == "short"
