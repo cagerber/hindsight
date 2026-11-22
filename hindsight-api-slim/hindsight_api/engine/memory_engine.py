@@ -14606,6 +14606,7 @@ class MemoryEngine(MemoryEngineInterface):
         document_id: str,
         *,
         request_context: "RequestContext",
+        force_reextract: bool = True,
     ) -> dict[str, Any]:
         """
         Reprocess a document by re-running retain with its existing content and parameters.
@@ -14677,7 +14678,11 @@ class MemoryEngine(MemoryEngineInterface):
         # this endpoint is for ("re-extract using the current engine configuration"). Whether it
         # no-opped or re-extracted depended on how faithfully retain_params happened to replay
         # (#3873), so the outcome was not even stable. Force it (#3899).
-        content_dict["force_reextract"] = True
+        # A plain reprocess re-extracts everything under the current config. Fork E3's span
+        # reconcile passes False: it has dropped one chunk and wants the replay to resume as a
+        # recovery, re-extracting only the chunk that is now missing.
+        if force_reextract:
+            content_dict["force_reextract"] = True
 
         tags = doc.get("tags") or []
         if tags:

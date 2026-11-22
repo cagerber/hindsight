@@ -1312,6 +1312,11 @@ ENV_LLM_TRACE_DELETE_WITH_DOCUMENT = "HINDSIGHT_API_LLM_TRACE_DELETE_WITH_DOCUME
 ENV_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS = "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS"
 ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS"
 ENV_RETENTION_SWEEP_INTERVAL_SECONDS = "HINDSIGHT_API_RETENTION_SWEEP_INTERVAL_SECONDS"
+# Bank-wide source-span filter (fork mitigation E3): skip paragraphs already extracted elsewhere.
+ENV_RETAIN_SPAN_FILTER = "HINDSIGHT_API_RETAIN_SPAN_FILTER"
+ENV_RETAIN_SPAN_FILTER_MIN_CHARS = "HINDSIGHT_API_RETAIN_SPAN_FILTER_MIN_CHARS"
+ENV_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS = "HINDSIGHT_API_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS"
+ENV_RETAIN_SPAN_ORPHAN_GRACE_SECONDS = "HINDSIGHT_API_RETAIN_SPAN_ORPHAN_GRACE_SECONDS"
 ENV_OPERATION_CLEANUP_INTERVAL_SECONDS = "HINDSIGHT_API_OPERATION_CLEANUP_INTERVAL_SECONDS"
 ENV_ATTACHMENT_SWEEP_INTERVAL_SECONDS = "HINDSIGHT_API_ATTACHMENT_SWEEP_INTERVAL_SECONDS"
 ENV_MAINTENANCE_START_JITTER_SECONDS = "HINDSIGHT_API_MAINTENANCE_START_JITTER_SECONDS"
@@ -2503,6 +2508,16 @@ DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS = 300
 # How often the audit_log / llm_requests retention sweeps run. Retention windows
 # are measured in days, so this only sets how promptly expired rows disappear.
 DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS = 3600
+# Source-span filter. Off by default: a paragraph already extracted from a chunk that outlives the
+# write is shown to the LLM as a short "[already retained: ...]" marker instead of in full.
+DEFAULT_RETAIN_SPAN_FILTER = False
+# Paragraphs shorter than this are never indexed or marked (a marker is ~100 chars itself).
+DEFAULT_RETAIN_SPAN_FILTER_MIN_CHARS = 160
+# How often the maintenance loop repairs references whose source paragraph is gone. 0 disables.
+DEFAULT_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS = 300
+# A reference must stay unresolvable this long before its chunk is re-extracted, so a replace
+# that deletes a source and re-writes the paragraph in a later sub-batch is not paid twice.
+DEFAULT_RETAIN_SPAN_ORPHAN_GRACE_SECONDS = 900
 
 # How often terminal async_operations rows past their retention are pruned. One
 # bounded batch per tenant schema per run, so this also sets the drain rate for a
@@ -4380,6 +4395,12 @@ class HindsightConfig:
     operation_cleanup_interval_seconds: int = DEFAULT_OPERATION_CLEANUP_INTERVAL_SECONDS
     attachment_sweep_interval_seconds: int = DEFAULT_ATTACHMENT_SWEEP_INTERVAL_SECONDS
     maintenance_start_jitter_seconds: int = DEFAULT_MAINTENANCE_START_JITTER_SECONDS
+
+    # Source-span filter (static, server-level; PostgreSQL banks only). See engine/retain/span_filter.py.
+    retain_span_filter: bool = DEFAULT_RETAIN_SPAN_FILTER
+    retain_span_filter_min_chars: int = DEFAULT_RETAIN_SPAN_FILTER_MIN_CHARS
+    retain_span_reconcile_interval_seconds: int = DEFAULT_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS
+    retain_span_orphan_grace_seconds: int = DEFAULT_RETAIN_SPAN_ORPHAN_GRACE_SECONDS
 
     # Retry/backoff applied to remote embedding API calls (see engine/remote_retry.py's RetryPolicy).
     embeddings_max_retries: int = DEFAULT_EMBEDDINGS_MAX_RETRIES
@@ -6372,6 +6393,26 @@ class HindsightConfig:
                 ENV_RETENTION_SWEEP_INTERVAL_SECONDS,
                 os.getenv(ENV_RETENTION_SWEEP_INTERVAL_SECONDS),
                 DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS,
+            ),
+            retain_span_filter=os.getenv(ENV_RETAIN_SPAN_FILTER, str(DEFAULT_RETAIN_SPAN_FILTER)).strip().lower()
+            in ("true", "1", "yes"),
+            retain_span_filter_min_chars=max(
+                40,
+                _parse_non_negative_int(
+                    ENV_RETAIN_SPAN_FILTER_MIN_CHARS,
+                    os.getenv(ENV_RETAIN_SPAN_FILTER_MIN_CHARS),
+                    DEFAULT_RETAIN_SPAN_FILTER_MIN_CHARS,
+                ),
+            ),
+            retain_span_reconcile_interval_seconds=_parse_non_negative_int(
+                ENV_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS,
+                os.getenv(ENV_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS),
+                DEFAULT_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS,
+            ),
+            retain_span_orphan_grace_seconds=_parse_non_negative_int(
+                ENV_RETAIN_SPAN_ORPHAN_GRACE_SECONDS,
+                os.getenv(ENV_RETAIN_SPAN_ORPHAN_GRACE_SECONDS),
+                DEFAULT_RETAIN_SPAN_ORPHAN_GRACE_SECONDS,
             ),
             vector_index_min_rows=_parse_non_negative_int(
                 ENV_VECTOR_INDEX_MIN_ROWS,

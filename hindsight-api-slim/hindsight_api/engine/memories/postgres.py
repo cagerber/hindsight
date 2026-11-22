@@ -65,6 +65,7 @@ from .pg import counts, curation, documents, engine_curation, graph, reads, writ
 from .pg import expand as pg_expand
 from .pg import links as pg_links
 from .pg import retain as pg_retain
+from .pg import span_index as pg_span_index
 from .pg import transfer as pg_transfer
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -1344,6 +1345,51 @@ class PostgresMemories(MemoriesExtension):
 
     async def unit_embeddings(self, *, conn, fq_table, bank_id: str, unit_ids: list[str]) -> list:
         return await pg_retain.unit_embeddings(conn=conn, fq_table=fq_store_table, bank_id=bank_id, unit_ids=unit_ids)
+
+    # Source-span index (fork E3), see pg/span_index.py. Oracle has no such tables.
+    def span_index_for(self, bank_id: str) -> bool:
+        from ..schema import _is_oracle
+
+        return not _is_oracle()
+
+    async def span_sources(
+        self,
+        *,
+        conn,
+        bank_id: str,
+        document_id: str,
+        kept_chunk_ids: list[str],
+        para_hashes: list[bytes],
+    ) -> dict[bytes, str]:
+        return await pg_span_index.sources(
+            conn=conn,
+            fq_table=fq_store_table,
+            bank_id=bank_id,
+            document_id=document_id,
+            kept_chunk_ids=kept_chunk_ids,
+            para_hashes=para_hashes,
+        )
+
+    async def span_record(self, *, conn, bank_id: str, chunks: list) -> None:
+        await pg_span_index.record(conn=conn, fq_table=fq_store_table, bank_id=bank_id, chunks=chunks)
+
+    async def span_maintain(
+        self,
+        *,
+        conn,
+        min_chars: int,
+        backfill_limit: int,
+        reconcile_limit: int,
+        grace_seconds: int,
+    ) -> Any:
+        return await pg_span_index.maintain(
+            conn=conn,
+            fq_table=fq_store_table,
+            min_chars=min_chars,
+            backfill_limit=backfill_limit,
+            reconcile_limit=reconcile_limit,
+            grace_seconds=grace_seconds,
+        )
 
     # Not on the interface: the bank list and a new bank's vector indexes are about Postgres's own
     # rows whatever store is configured, so callers reach these through ``sql_memories()``.

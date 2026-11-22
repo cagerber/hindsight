@@ -2779,6 +2779,15 @@ async def extract_facts_from_text(
         max_attachments_per_chunk=config.retain_max_attachments_per_chunk,
     )
 
+    # Fork E3: the LLM sees a marker instead of any paragraph a surviving chunk of the bank already
+    # extracted. ``chunks`` keeps the original text (stored, hashed, attributed); only the prompt
+    # changes. A chunk left with nothing but markers is not sent at all.
+    from . import span_filter as _span
+
+    _span_active = _span.current()
+    prompt_chunks = await _span_active.prompt_texts(chunks) if _span_active is not None else chunks
+    skip_llm = {i for i, c in enumerate(prompt_chunks) if c is not chunks[i] and _span.only_markers(c)}
+
     # Log chunk count before starting LLM requests
     total_chars = sum(len(c) for c in chunks)
     if len(chunks) > 1:
@@ -2792,8 +2801,13 @@ async def extract_facts_from_text(
     # handled by the middle loop in _extract_facts_from_chunk.  Adding a third
     # retry layer here would multiply wasted calls on deterministic failures
     # (see https://github.com/vectorize-io/hindsight/issues/1412).
+    async def _no_new_text() -> tuple[list, TokenUsage]:
+        return [], TokenUsage()
+
     tasks = [
-        _extract_facts_with_auto_split(
+        _no_new_text()
+        if i in skip_llm
+        else _extract_facts_with_auto_split(
             chunk=chunk,
             chunk_index=i,
             total_chunks=len(chunks),
@@ -2807,7 +2821,7 @@ async def extract_facts_from_text(
             vlm_config=vlm_config,
             extraction_prompt=extraction_prompt,
         )
-        for i, chunk in enumerate(chunks)
+        for i, chunk in enumerate(prompt_chunks)
     ]
 
     # return_exceptions=True so we can collect all results even if some chunks

@@ -127,6 +127,9 @@ _RETENTION_BATCH_PAUSE_SECONDS = 0.25
 # `hindsight-admin repair-bank --attachments` is for, the same rule with no
 # lower bound.
 _ATTACHMENT_SWEEP_LOOKBACK = timedelta(days=7)
+# Fork E3: per-pass bounds of the span-index backfill and dangling-reference repair.
+_SPAN_BACKFILL_LIMIT = 2000
+_SPAN_RECONCILE_LIMIT = 500
 
 
 @dataclass(frozen=True)
@@ -223,7 +226,8 @@ class MaintenanceLoop:
         mm_refresh_on = cfg.mental_model_refresh_tick_seconds > 0
         op_cleanup_on = cfg.operation_cleanup_interval_seconds > 0 and cfg.operation_retention_days > 0
         attachment_sweep_on = cfg.attachment_sweep_interval_seconds > 0
-        return reconcile_on or audit_on or llm_on or mm_refresh_on or op_cleanup_on or attachment_sweep_on
+        span_on = getattr(cfg, "retain_span_reconcile_interval_seconds", 0) > 0
+        return reconcile_on or audit_on or llm_on or mm_refresh_on or op_cleanup_on or attachment_sweep_on or span_on
 
     # ── loop ───────────────────────────────────────────────────────────────
 
@@ -290,6 +294,9 @@ class MaintenanceLoop:
         attachment_interval = cfg.attachment_sweep_interval_seconds
         if attachment_interval > 0 and self._is_due("attachment_sweep", attachment_interval):
             await self._run_timed("attachment sweep", self._run_attachment_sweep())
+        span_interval = getattr(cfg, "retain_span_reconcile_interval_seconds", 0)
+        if span_interval > 0 and self._is_due("span_reconcile", span_interval):
+            await self._run_timed("span reconcile", self._run_span_reconcile(cfg))
 
     async def _run_timed(self, name: str, coro: Coroutine[Any, Any, None]) -> None:
         """Run a maintenance job and emit one timing line for it.
@@ -528,6 +535,83 @@ class MaintenanceLoop:
                 _current_schema.reset(token)
         if removed:
             logger.info(f"Attachment sweep: deleted {removed} attachment(s) of retains that failed")
+
+    # ── source-span reconcile (fork E3) ──────────────────────────────────────
+
+    async def _run_span_reconcile(self, cfg: ConfigLike) -> None:
+        """Backfill the source-span index and repair references whose source chunk is gone.
+
+        Per served schema: index a bounded batch of chunks stored before the index existed (only
+        while the filter is on), then repoint or orphan dangling references. A chunk whose
+        reference stayed unresolvable past the grace period is deleted with its facts and its
+        document replayed; the resumed retain re-extracts exactly that chunk with the paragraph in
+        full. Only documents with stored text are replayed - without it the marker stays (the
+        facts are not lost, only no longer backed by a live source chunk).
+        """
+        if _is_oracle():
+            return
+        from .memories import get_memories
+        from .retain import chunk_storage
+
+        engine = self._engine
+        store = get_memories()
+        try:
+            tenants = await engine._tenant_extension.list_tenants()
+        except Exception as e:
+            logger.warning(f"Span reconcile tenant discovery failed: {e}")
+            return
+        targets = {t.schema: t for t in tenants}
+        default_schema = get_config().database_schema
+        schemas: list[tuple[str, Any]] = [(default_schema, targets.pop(default_schema, None))]
+        schemas += sorted(targets.items(), key=lambda kv: kv[0])
+
+        totals = {"indexed": 0, "repointed": 0, "orphaned": 0, "cleared": 0, "restored": 0}
+        for schema, tenant in schemas:
+            if self._stop.is_set():
+                break
+            token = _current_schema.set(schema)
+            try:
+                async with acquire_with_retry(engine._backend, max_retries=1) as conn:
+                    async with conn.transaction():
+                        result = await store.span_maintain(
+                            conn=conn,
+                            min_chars=cfg.retain_span_filter_min_chars,
+                            backfill_limit=_SPAN_BACKFILL_LIMIT if cfg.retain_span_filter else 0,
+                            reconcile_limit=_SPAN_RECONCILE_LIMIT,
+                            grace_seconds=cfg.retain_span_orphan_grace_seconds,
+                        )
+                if result is None:
+                    continue
+                for key in ("indexed", "repointed", "orphaned", "cleared"):
+                    totals[key] += getattr(result, key)
+                for bank_id, document_id, chunk_id in result.restore:
+                    context = RequestContext(internal=True, tenant_id=tenant.tenant_id if tenant else None)
+                    if await self._restore_span_chunk(bank_id, document_id, chunk_id, context, chunk_storage):
+                        totals["restored"] += 1
+            except Exception as e:
+                logger.warning(f"Span reconcile failed in {schema}: {e}")
+            finally:
+                _current_schema.reset(token)
+        if any(totals.values()):
+            logger.info("Span reconcile: " + ", ".join(f"{k}={v}" for k, v in totals.items()))
+
+    async def _restore_span_chunk(
+        self, bank_id: str, document_id: str, chunk_id: str, context: RequestContext, chunk_storage: Any
+    ) -> bool:
+        """Drop one marked chunk whose source is gone and replay its document to re-extract it."""
+        engine = self._engine
+        doc = await engine.get_document(document_id, bank_id, request_context=context)
+        if not doc or not doc.get("original_text"):
+            return False
+        async with acquire_with_retry(engine._backend, max_retries=1) as conn:
+            async with conn.transaction():
+                await chunk_storage.delete_chunks_by_ids(conn, [chunk_id], bank_id, ops=engine._backend.ops)
+        result = await engine.reprocess_document(bank_id, document_id, request_context=context, force_reextract=False)
+        if result is None:
+            logger.warning(f"Span reconcile: could not replay {document_id} in {bank_id} after dropping {chunk_id}")
+            return False
+        logger.info(f"Span reconcile: re-extracting chunk {chunk_id} of {document_id} ({bank_id}), source gone")
+        return True
 
     # ── consolidation reconcile ──────────────────────────────────────────────
 

@@ -2302,132 +2302,156 @@ async def retain_batch(
     # entities against Postgres and takes its document lock on a `documents` row that store-owned
     # banks no longer have: `current_hash` comes back None, the stale-chunk guard never fires, and
     # delta ran with no concurrency control at all.
-    from ..memories import get_memories as _get_memories_delta
+    # Fork E3: the bank-wide source-span filter for this document (None when off), seen by the
+    # extraction calls and the chunk-storing transactions below through a context variable.
+    from . import span_filter as _span_filter_mod
 
-    _delta_provider = _get_memories_delta()
-    if not force_reextract and attempts_delta_retain(_delta_provider, bank_id, is_first_batch):
-        with track_observation_changes() as delta_changes:
-            delta_result = await _try_delta_retain(
-                pool,
-                embeddings_model,
-                llm_config,
-                entity_resolver,
-                format_date_fn,
-                bank_id,
-                contents_dicts,
-                contents,
-                config,
-                effective_doc_id,
-                fact_type_override,
-                document_tags,
-                log_buffer,
-                elapsed_start,
-                operation_id,
-                schema,
-                outbox_callback,
-                db_semaphore,
-                document_prefetch=document_prefetch,
+    with _span_filter_mod.activated(
+        _span_filter_mod.for_retain(pool, bank_id, effective_doc_id, config, force_reextract=force_reextract)
+    ):
+        from ..memories import get_memories as _get_memories_delta
+
+        _delta_provider = _get_memories_delta()
+        if not force_reextract and attempts_delta_retain(_delta_provider, bank_id, is_first_batch):
+            with track_observation_changes() as delta_changes:
+                delta_result = await _try_delta_retain(
+                    pool,
+                    embeddings_model,
+                    llm_config,
+                    entity_resolver,
+                    format_date_fn,
+                    bank_id,
+                    contents_dicts,
+                    contents,
+                    config,
+                    effective_doc_id,
+                    fact_type_override,
+                    document_tags,
+                    log_buffer,
+                    elapsed_start,
+                    operation_id,
+                    schema,
+                    outbox_callback,
+                    db_semaphore,
+                    document_prefetch=document_prefetch,
+                    full_document_body=full_document_body,
+                    delta_full_body=_delta_full_body,
+                    document_body_hash=document_body_hash,
+                    append_base_hash=append_base_hash,
+                    attachment_loader=attachment_loader,
+                    fact_filter=fact_filter,
+                    vlm_config=vlm_config,
+                )
+            if delta_result is not None:
+                await _record_retain_event(
+                    pool,
+                    bank_id,
+                    effective_doc_id,
+                    update_mode,
+                    force_reextract,
+                    operation_id,
+                    delta_result,
+                    delta_changes,
+                )
+                return _align_result(delta_result)
+
+        # --- Always use the streaming pipeline (producer-consumer batching) ---
+        # Even small documents go through the same path — they just end up as a
+        # single batch. This eliminates the maintenance burden of two separate
+        # retain code paths.
+        chunk_batch_size = config.retain_chunk_batch_size
+        # Direct attribute access, never getattr-with-default: these two decide chunk
+        # boundaries, and the delta path must derive them from the very same resolved
+        # config object. A getattr default silently substitutes the global value when
+        # handed the wrong config (StaticConfigProxy raises ConfigFieldAccessError,
+        # an AttributeError subclass, for bank-configurable fields) — which re-chunks
+        # at different boundaries and makes every stored chunk look changed. Fail loud.
+        chunk_size = config.retain_chunk_size
+        structured_chunk_size = config.retain_structured_chunk_size
+        # Same reasoning for the image cap: it moves chunk boundaries in exactly the
+        # same way, so it must come from this resolved config too.
+        max_attachments_per_chunk = config.retain_max_attachments_per_chunk
+        all_pre_chunks: list[str] = []
+        chunk_to_content: list[int] = []  # maps chunk index -> index into contents
+        for content_idx, content in enumerate(contents):
+            # Streamed, not materialised per content: `iter_chunks` yields each chunk as it is
+            # cut, so the peak here is one chunk rather than the intermediate splits an eager
+            # chunker builds for the whole body (a 45 MB one cost ~130 MB live before #3756).
+            for chunk in fact_extraction.iter_chunks(
+                content.content,
+                chunk_size,
+                structured_chunk_size=structured_chunk_size,
+                max_attachments_per_chunk=max_attachments_per_chunk,
+            ):
+                all_pre_chunks.append(chunk)
+                chunk_to_content.append(content_idx)
+
+        # Memory: after chunking, the original content bodies in RetainContent are
+        # no longer needed (all_pre_chunks holds the working set). Clear them so
+        # Python can reclaim the (potentially multi-MB) strings.
+        # Note: contents_dicts["content"] is still needed briefly for hash computation
+        # inside _streaming_retain_batch, but gets cleared there after use.
+        for content in contents:
+            content.content = ""
+
+        total_pre_chunks = len(all_pre_chunks)
+        num_batches = (total_pre_chunks + chunk_batch_size - 1) // chunk_batch_size if total_pre_chunks > 0 else 1
+        log_buffer.append(
+            f"[streaming] {total_pre_chunks} chunks, batch_size {chunk_batch_size} — "
+            f"{num_batches} batch{'es' if num_batches != 1 else ''}"
+        )
+
+        with track_observation_changes() as stream_changes:
+            result = await _streaming_retain_batch(
+                pool=pool,
+                embeddings_model=embeddings_model,
+                llm_config=llm_config,
+                entity_resolver=entity_resolver,
+                format_date_fn=format_date_fn,
+                bank_id=bank_id,
+                contents_dicts=contents_dicts,
+                contents=contents,
+                config=config,
+                document_id=effective_doc_id,
+                is_first_batch=is_first_batch,
+                fact_type_override=fact_type_override,
+                document_tags=document_tags,
+                log_buffer=log_buffer,
+                start_time=elapsed_start,
+                all_pre_chunks=all_pre_chunks,
+                chunk_to_content=chunk_to_content,
+                chunk_batch_size=chunk_batch_size,
+                operation_id=operation_id,
+                schema=schema,
+                outbox_callback=outbox_callback,
+                db_semaphore=db_semaphore,
                 full_document_body=full_document_body,
-                delta_full_body=_delta_full_body,
                 document_body_hash=document_body_hash,
+                chunk_index_offset=chunk_index_offset,
+                body_accum=body_accum,
+                retain_session=retain_session,
+                document_prefetch=document_prefetch,
+                progress_callback=progress_callback,
                 append_base_hash=append_base_hash,
+                force_reextract=force_reextract,
                 attachment_loader=attachment_loader,
                 fact_filter=fact_filter,
                 vlm_config=vlm_config,
             )
-        if delta_result is not None:
-            await _record_retain_event(
-                pool, bank_id, effective_doc_id, update_mode, force_reextract, operation_id, delta_result, delta_changes
-            )
-            return _align_result(delta_result)
-
-    # --- Always use the streaming pipeline (producer-consumer batching) ---
-    # Even small documents go through the same path — they just end up as a
-    # single batch. This eliminates the maintenance burden of two separate
-    # retain code paths.
-    chunk_batch_size = config.retain_chunk_batch_size
-    # Direct attribute access, never getattr-with-default: these two decide chunk
-    # boundaries, and the delta path must derive them from the very same resolved
-    # config object. A getattr default silently substitutes the global value when
-    # handed the wrong config (StaticConfigProxy raises ConfigFieldAccessError,
-    # an AttributeError subclass, for bank-configurable fields) — which re-chunks
-    # at different boundaries and makes every stored chunk look changed. Fail loud.
-    chunk_size = config.retain_chunk_size
-    structured_chunk_size = config.retain_structured_chunk_size
-    # Same reasoning for the image cap: it moves chunk boundaries in exactly the
-    # same way, so it must come from this resolved config too.
-    max_attachments_per_chunk = config.retain_max_attachments_per_chunk
-    all_pre_chunks: list[str] = []
-    chunk_to_content: list[int] = []  # maps chunk index -> index into contents
-    for content_idx, content in enumerate(contents):
-        # Streamed, not materialised per content: `iter_chunks` yields each chunk as it is
-        # cut, so the peak here is one chunk rather than the intermediate splits an eager
-        # chunker builds for the whole body (a 45 MB one cost ~130 MB live before #3756).
-        for chunk in fact_extraction.iter_chunks(
-            content.content,
-            chunk_size,
-            structured_chunk_size=structured_chunk_size,
-            max_attachments_per_chunk=max_attachments_per_chunk,
-        ):
-            all_pre_chunks.append(chunk)
-            chunk_to_content.append(content_idx)
-
-    # Memory: after chunking, the original content bodies in RetainContent are
-    # no longer needed (all_pre_chunks holds the working set). Clear them so
-    # Python can reclaim the (potentially multi-MB) strings.
-    # Note: contents_dicts["content"] is still needed briefly for hash computation
-    # inside _streaming_retain_batch, but gets cleared there after use.
-    for content in contents:
-        content.content = ""
-
-    total_pre_chunks = len(all_pre_chunks)
-    num_batches = (total_pre_chunks + chunk_batch_size - 1) // chunk_batch_size if total_pre_chunks > 0 else 1
-    log_buffer.append(
-        f"[streaming] {total_pre_chunks} chunks, batch_size {chunk_batch_size} — "
-        f"{num_batches} batch{'es' if num_batches != 1 else ''}"
-    )
-
-    with track_observation_changes() as stream_changes:
-        result = await _streaming_retain_batch(
-            pool=pool,
-            embeddings_model=embeddings_model,
-            llm_config=llm_config,
-            entity_resolver=entity_resolver,
-            format_date_fn=format_date_fn,
-            bank_id=bank_id,
-            contents_dicts=contents_dicts,
-            contents=contents,
-            config=config,
-            document_id=effective_doc_id,
-            is_first_batch=is_first_batch,
-            fact_type_override=fact_type_override,
-            document_tags=document_tags,
-            log_buffer=log_buffer,
-            start_time=elapsed_start,
-            all_pre_chunks=all_pre_chunks,
-            chunk_to_content=chunk_to_content,
-            chunk_batch_size=chunk_batch_size,
-            operation_id=operation_id,
-            schema=schema,
-            outbox_callback=outbox_callback,
-            db_semaphore=db_semaphore,
-            full_document_body=full_document_body,
-            document_body_hash=document_body_hash,
-            chunk_index_offset=chunk_index_offset,
-            body_accum=body_accum,
-            retain_session=retain_session,
-            document_prefetch=document_prefetch,
-            progress_callback=progress_callback,
-            append_base_hash=append_base_hash,
-            force_reextract=force_reextract,
-            attachment_loader=attachment_loader,
-            fact_filter=fact_filter,
-            vlm_config=vlm_config,
+        await _record_retain_event(
+            pool, bank_id, effective_doc_id, update_mode, force_reextract, operation_id, result, stream_changes
         )
-    await _record_retain_event(
-        pool, bank_id, effective_doc_id, update_mode, force_reextract, operation_id, result, stream_changes
-    )
-    return _align_result(result)
+        return _align_result(result)
+
+
+async def _span_record(conn: Any, chunks: list, chunk_id_map: dict[int, str]) -> None:
+    """Fork E3: index chunks just stored in this transaction for the source-span filter of the
+    retain running in this context (a no-op when it has none)."""
+    from . import span_filter as _span_filter_mod
+
+    active = _span_filter_mod.current()
+    if active is not None and chunk_id_map:
+        await active.record_stored(conn, chunks, chunk_id_map)
 
 
 # ---------------------------------------------------------------------------
@@ -3757,6 +3781,7 @@ async def _streaming_retain_batch(
                             ops=pool.ops,
                             store_document_text=config.store_document_text,
                         )
+                        await _span_record(conn, batch_chunk_meta, chunk_id_map)
                         log_buffer.append(
                             f"  Store chunks: {len(batch_chunk_meta)} chunks in {time.perf_counter() - step_start:.3f}s"
                         )
@@ -4292,6 +4317,12 @@ async def _try_delta_retain(
     new_hashes = {idx: chunk_storage.compute_chunk_hash(text) for idx, text in new_chunks_with_contents.items()}
 
     diff = _classify_chunk_diff(existing_by_index, new_hashes)
+    from . import span_filter as _span_filter_mod
+
+    if (_active_span := _span_filter_mod.current()) is not None:
+        # Only the chunks this write keeps may serve as same-document sources: the changed and
+        # removed ones are about to be deleted with their facts.
+        _active_span.set_kept({existing_by_index[i].chunk_id for i in diff.unchanged if i in existing_by_index})
     unchanged_indices = diff.unchanged
     changed_indices = diff.changed
     new_indices = diff.new
@@ -4748,6 +4779,7 @@ async def _try_delta_retain(
                             ops=pool.ops,
                             store_document_text=config.store_document_text,
                         )
+                        await _span_record(conn, remapped_chunks, chunk_id_map)
                         for chunk_idx, chunk_id in chunk_id_map.items():
                             chunk_id_map_by_doc[(effective_doc_id, chunk_idx)] = chunk_id
                         log_buffer.append(

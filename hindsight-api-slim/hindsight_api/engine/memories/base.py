@@ -3926,6 +3926,47 @@ class MemoriesExtension(Extension, ABC):
         dedup then asks every pair among the kept candidates."""
         return []
 
+    # ------------------------------------------------------------------ source-span index (fork E3)
+    #
+    # Retain's bank-wide paragraph filter (engine/retain/span_filter.py) shows the LLM a short
+    # marker instead of a paragraph some surviving chunk already extracted. The index behind it is
+    # chunk-keyed, so only a store with SQL chunk rows has one; every default here is "no index",
+    # which leaves the filter off for the bank.
+
+    def span_index_for(self, bank_id: str) -> bool:
+        """Whether this store keeps the source-span index for ``bank_id``. False here."""
+        return False
+
+    async def span_sources(
+        self,
+        *,
+        conn,
+        bank_id: str,
+        document_id: str,
+        kept_chunk_ids: list[str],
+        para_hashes: list[bytes],
+    ) -> dict[bytes, str]:
+        """Paragraph hash -> a live chunk that already extracted it (another document's, or one of
+        ``kept_chunk_ids`` of this document). Empty here: nothing is ever marked."""
+        return {}
+
+    async def span_record(self, *, conn, bank_id: str, chunks: list) -> None:
+        """Replace the index rows of just-stored chunks (``SpanChunk`` items). A no-op here."""
+        return None
+
+    async def span_maintain(
+        self,
+        *,
+        conn,
+        min_chars: int,
+        backfill_limit: int,
+        reconcile_limit: int,
+        grace_seconds: int,
+    ) -> Any:
+        """Backfill the index and repair references whose source is gone, for the current schema.
+        None here (no index to maintain)."""
+        return None
+
     # ------------------------------------------------------------------ retain links and entity resolution
     #
     # The retain-time link writes, the ANN neighbour search behind them, and entity resolution.

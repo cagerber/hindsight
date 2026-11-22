@@ -23,6 +23,10 @@ STORE_TABLES = frozenset(
         "entities",
         "entity_cooccurrences",
         "invalidated_memory_units",
+        # Fork E3: the Postgres store's source-span index.
+        "chunk_paragraphs",
+        "chunk_span_index",
+        "span_refs",
     }
 )
 
