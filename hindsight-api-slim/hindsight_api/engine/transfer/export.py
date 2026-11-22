@@ -77,6 +77,11 @@ _REPLAYED_TABLES = frozenset(
         # There is no stable observation id to re-attach history to, so it is not
         # carried; the target rebuilds observation history as it re-consolidates.
         "observation_history",
+        # Fork E3: the source-span index is rebuilt as the replay stores chunks
+        # (and the maintenance backfill covers anything stored with it off).
+        "chunk_span_index",
+        "chunk_paragraphs",
+        "span_refs",
     }
 )
 # Carried verbatim as JSON rows (bank config + synthesized state). Embedding-bearing
@@ -125,6 +130,9 @@ _SKIP_TABLES = frozenset(
         "kb_passage_vectors",
         "kb_staged_passages",
         "kb_staged_passage_vectors",
+        # Fork E4: the extraction checkpoint cache is keyed to the source's model,
+        # prompt and schema; the target starts it cold rather than trusting it.
+        "extraction_cache",
     }
 )
 # Derived columns dropped from carried rows so the target regenerates them with

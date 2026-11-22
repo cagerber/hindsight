@@ -70,6 +70,13 @@ BACKUP_TABLES = [
     "documents",
     "entities",
     "chunks",
+    # Fork E3: the source-span index FKs to chunks, so it follows them.
+    "chunk_span_index",
+    "chunk_paragraphs",
+    "span_refs",
+    # Fork E4: the extraction checkpoint cache has no FK; backed up so a
+    # restore keeps the paid-for extractions instead of starting cold.
+    "extraction_cache",
     "memory_units",
     "invalidated_memory_units",
     "unit_entities",
