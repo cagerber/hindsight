@@ -1733,6 +1733,7 @@ async def _fetch_unconsolidated_rows(
             "tags": list(m.tags or []),
             "mentioned_at": m.mentioned_at,
             "observation_scopes": m.observation_scopes,
+            "metadata": m.metadata or {},
             # Read-time version: the write re-checks it (see _sources_changed_since_read).
             "updated_at": m.updated_at,
         }
@@ -2023,6 +2024,30 @@ async def _run_consolidation_job(
 
         if not memories:
             break  # No more unconsolidated memories
+
+        # Opt-in (HINDSIGHT_API_CONSOLIDATION_SKIP_SESSION_INGEST): session_ingest memories
+        # (raw terminal commands / file listings from session transcripts) are noise the LLM
+        # cannot use. Stamp them consolidated without an LLM call and keep them out of the batch.
+        if config.consolidation_skip_session_ingest:
+            skipped = [m for m in memories if (m.get("metadata") or {}).get("kind") == "session_ingest"]
+            if skipped:
+                logger.info(
+                    f"[CONSOLIDATION] bank={bank_id} skipping {len(skipped)} session_ingest "
+                    "memories (marked consolidated, no LLM call)"
+                )
+                async with acquire_with_retry(pool) as conn:
+                    await get_memories().mark_consolidated(
+                        conn=conn,
+                        fq_table=fq_table,
+                        bank_id=bank_id,
+                        unit_ids=[str(m["id"]) for m in skipped],
+                        when=datetime.now(timezone.utc),
+                        failed=False,
+                    )
+                cumulative_progress["processed"] += len(skipped)
+                memories = [m for m in memories if m not in skipped]
+                if not memories:
+                    continue  # Fetch the next round
 
         # Group memories by target observation scope before batching — security
         # requirement: memories targeting different scopes must never share an

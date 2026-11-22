@@ -164,6 +164,12 @@ async def retrieve_semantic_bm25_combined_sql(
         updated_range_clause += f" AND updated_at < ${_next_idx}"
         _next_idx += 1
 
+    # session_ingest filter (opt-in): raw terminal commands / file listings from session
+    # transcripts. IS DISTINCT FROM keeps rows that have no ``kind`` at all (NULL != 'x'
+    # would drop them). Postgres-only syntax, like the rest of this file's arms.
+    if getattr(config, "recall_skip_session_ingest", False):
+        updated_range_clause += " AND metadata->>'kind' IS DISTINCT FROM 'session_ingest'"
+
     # --- Semantic UNION ALL arms (one per fact_type) ---
     # Each arm has its own ORDER BY ... LIMIT, enabling the partial HNSW indexes
     # per fact_type instead of forcing a full sequential scan.
@@ -419,6 +425,11 @@ async def retrieve_temporal_combined_sql(
     if end_date.tzinfo is None:
         end_date = end_date.replace(tzinfo=UTC)
 
+    # session_ingest filter (opt-in; see retrieve_semantic_bm25_combined_sql).
+    kind_clause = ""
+    if getattr(get_config(), "recall_skip_session_ingest", False):
+        kind_clause = " AND metadata->>'kind' IS DISTINCT FROM 'session_ingest'"
+
     # Build tags clause
     # Entry-point query: fixed params are $1-$5 (emb, bank, start, end, threshold), tags at $6.
     # fact_type is inlined as a literal per UNION ALL arm (not a bind) — this avoids `unnest`,
@@ -503,6 +514,7 @@ async def retrieve_temporal_combined_sql(
           {tags_clause}
           {groups_clause}
           {updated_range_clause}
+          {kind_clause}
         ORDER BY embedding <=> $1::vector
         LIMIT {_TEMPORAL_POOL_SIZE}
         )"""
