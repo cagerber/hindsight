@@ -295,3 +295,46 @@ async def test_budget_counts_backfill_claimed_in_the_last_hour(pool, backend, cl
         spent_without_window = await backend.ops.backfill_budget_spent_banks(conn, _TABLE, 10_000, 0)
     assert sorted(spent) == [heavy]
     assert sorted(spent_without_window) == sorted([heavy, live_only])
+
+
+@pytest.mark.asyncio
+async def test_old_head_of_a_live_document_queue_is_live(pool, backend, clean_operations):
+    """Per-key order holds a session's new write behind its oldest pending write.
+
+    Seen live: a session's appends queued 2-12 h earlier headed its document queue, so every new
+    turn waited behind a September backlog sitting in the FIFO tier. The head is live too.
+    """
+    bank = await _make_bank(pool)
+    backlog = await _insert_op(pool, bank, age_seconds=60 * 24 * H)
+    head = await _insert_op(pool, bank, age_seconds=12 * H, serialization_key="session-1")
+    await _insert_op(pool, bank, age_seconds=60, serialization_key="session-1")
+    assert _ids(await _claim(backend, shared=1, window=6)) == [str(head)]
+    assert backlog
+
+
+@pytest.mark.asyncio
+async def test_old_head_without_a_recent_write_stays_in_fifo_order(pool, backend, clean_operations):
+    bank = await _make_bank(pool)
+    backlog = await _insert_op(pool, bank, age_seconds=60 * 24 * H)
+    await _insert_op(pool, bank, age_seconds=12 * H, serialization_key="session-1")
+    assert _ids(await _claim(backend, shared=1, window=6)) == [str(backlog)]
+
+
+@pytest.mark.asyncio
+async def test_budget_never_holds_back_a_live_head(pool, backend, clean_operations):
+    bank = await _make_bank(pool)
+    await _insert_op(pool, bank, age_seconds=60 * 24 * H)
+    head = await _insert_op(pool, bank, age_seconds=12 * H, serialization_key="session-1")
+    await _insert_op(pool, bank, age_seconds=60, serialization_key="session-1")
+    shared = await _claim(backend, shared=5, window=6, excluded=(bank,))
+    assert _ids(shared) == [str(head)]
+
+
+@pytest.mark.asyncio
+async def test_reserved_slots_promote_a_live_head(pool, backend, clean_operations):
+    bank = await _make_bank(pool)
+    await _insert_op(pool, bank, age_seconds=60 * 24 * H)
+    head = await _insert_op(pool, bank, age_seconds=12 * H, serialization_key="session-1")
+    await _insert_op(pool, bank, age_seconds=60, serialization_key="session-1")
+    claimed = await _claim(backend, shared=0, reserved={"retain": 1}, window=6, excluded=(bank,))
+    assert _ids(claimed) == [str(head)]

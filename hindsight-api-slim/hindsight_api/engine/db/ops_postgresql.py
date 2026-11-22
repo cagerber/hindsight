@@ -1863,9 +1863,9 @@ class PostgreSQLOps(DataAccessOps):
         keep a shared pool.
 
         ``live_window_hours`` and ``backfill_excluded_banks`` mean what they do in
-        ``_claim_shared_tasks``: rows queued within the window are claimed first (a
-        second bounded range scan rather than a sort), and an excluded bank's retains
-        queued before the window are skipped.
+        ``_claim_shared_tasks``: live rows (inside the window, or heading a document
+        queue with a write inside it) are claimed first, then the rest oldest-first,
+        where an excluded bank's retains queued before the window are skipped.
         """
 
         async def _fetch(lim: int, extra: str, args: list) -> list:
@@ -1901,7 +1901,16 @@ class PostgreSQLOps(DataAccessOps):
             skip = f" AND NOT (o.operation_type = 'retain' AND o.bank_id = ANY(${len(args) + 2}::text[]){old})"
         rows: list = []
         if live_window_hours > 0:
-            rows = await _fetch(limit, " AND o.created_at > NOW() - make_interval(hours => $3)" + skip, args)
+            # Inside the window, or the head of a document queue with a write inside it (see
+            # _claim_shared_tasks). Live rows are never held back by the backfill budget.
+            live = f"""
+                  AND (o.created_at > NOW() - make_interval(hours => $3)
+                       OR (o.bank_id, o.serialization_key) IN (
+                           SELECT p.bank_id, p.serialization_key FROM {table} p
+                           WHERE p.status = 'pending' AND p.task_payload IS NOT NULL
+                             AND p.serialization_key IS NOT NULL
+                             AND p.created_at > NOW() - make_interval(hours => $3)))"""
+            rows = await _fetch(limit, live, args[:1])
         if len(rows) < limit:
             taken = [r["operation_id"] for r in rows]
             rest_args = [*args, taken]
@@ -1967,11 +1976,14 @@ class PostgreSQLOps(DataAccessOps):
 
         With ``live_window_hours`` > 0 a ``live`` tier sits between the two: rows
         queued within the window, oldest first, ahead of the backlog behind them.
-        It is the same ``created_at`` range scan as ``fifo``, bounded by the
-        window, so live work no longer waits behind a backfill that is already
-        due. ``backfill_excluded_banks`` drops those banks' retains queued before
-        the window from every tier (their hourly backfill budget is spent; the
-        poller works the list out, so the claim adds only an array test).
+        It takes rows queued inside the window, plus the head of every document
+        queue that has a write inside the window (per-key order would otherwise
+        hold the recent write behind an old head sitting in ``fifo``), so live
+        work no longer waits behind a backfill that is already due.
+        ``backfill_excluded_banks`` drops those banks' retains queued before the
+        window from the rotation and FIFO tiers (their hourly backfill budget is
+        spent; the poller works the list out, so the claim adds only an array
+        test). Live rows are never held back by it.
         """
         params: list = [bank_cursor]
         exclusion = ""
@@ -1988,9 +2000,12 @@ class PostgreSQLOps(DataAccessOps):
             params.append(int(live_window_hours))
             idx += 1
 
+        # The budget holds back an excluded bank's backfill in the rotation and FIFO tiers only:
+        # whatever the live tier takes is live by definition.
+        backfill_skip = ""
         if backfill_excluded_banks:
             older = f" AND o.created_at <= {window}" if window else ""
-            exclusion += f" AND NOT (o.operation_type = 'retain' AND o.bank_id = ANY(${idx}::text[]){older})"
+            backfill_skip = f" AND NOT (o.operation_type = 'retain' AND o.bank_id = ANY(${idx}::text[]){older})"
             params.append(list(backfill_excluded_banks))
             idx += 1
 
@@ -2006,13 +2021,32 @@ class PostgreSQLOps(DataAccessOps):
         live_union = ""
         not_live = ""
         if window:
-            live = f""", live AS (
-                SELECT o.operation_id, 1 AS tier, o.created_at
+            # A key (one document's writes, run in order) with a write inside the window is live,
+            # and so is the oldest pending row holding that key: per-key order means the recent
+            # write cannot run until that head has, however old the head is. ``live_keys`` is a
+            # range scan over the window; the head is found through the serialization-key index.
+            live = f""", live_keys AS (
+                SELECT DISTINCT o.bank_id, o.serialization_key
                 FROM {table} o
-                WHERE {claimable}
+                WHERE o.status = 'pending'
+                  AND o.task_payload IS NOT NULL
+                  AND o.serialization_key IS NOT NULL
                   AND o.created_at > {window}
-                  AND NOT EXISTS (SELECT 1 FROM rot WHERE rot.operation_id = o.operation_id)
-                ORDER BY o.created_at
+            ), live AS (
+                SELECT l.operation_id, 1 AS tier, l.created_at
+                FROM (
+                    SELECT o.operation_id, o.created_at
+                    FROM {table} o
+                    WHERE {claimable}
+                      AND o.created_at > {window}
+                    UNION
+                    SELECT o.operation_id, o.created_at
+                    FROM live_keys k
+                    JOIN {table} o ON o.bank_id = k.bank_id AND o.serialization_key = k.serialization_key
+                    WHERE {claimable}
+                ) l
+                WHERE NOT EXISTS (SELECT 1 FROM rot WHERE rot.operation_id = l.operation_id)
+                ORDER BY l.created_at
                 LIMIT ${idx}
             )"""
             live_union = " UNION ALL SELECT * FROM live"
@@ -2025,14 +2059,14 @@ class PostgreSQLOps(DataAccessOps):
             WITH rot AS (
                 SELECT o.operation_id, 0 AS tier, o.created_at
                 FROM {table} o
-                WHERE {claimable}
+                WHERE {claimable}{backfill_skip}
                   AND o.bank_id > $1
                 ORDER BY o.bank_id
                 LIMIT 1
             ){live}, fifo AS (
                 SELECT o.operation_id, 2 AS tier, o.created_at
                 FROM {table} o
-                WHERE {claimable}
+                WHERE {claimable}{backfill_skip}
                   AND NOT EXISTS (SELECT 1 FROM rot WHERE rot.operation_id = o.operation_id){not_live}
                 ORDER BY o.created_at
                 LIMIT ${idx}
