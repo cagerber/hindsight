@@ -117,6 +117,13 @@ def key_serialization_sql(table: str, alias: str) -> str:
     only the operations that were racing each other for one document, or one
     model, are put in a line.
 
+    An older peer waiting out a retry backoff (``next_retry_at`` in the future)
+    still holds its place. Skipping it let the next append for the document run
+    first, so a retried append landed after turns that were submitted later and
+    the stored conversation came out of order. Retain retries are short, and a
+    deferral that should not block (a refresh deferred within its interval) is
+    overtaken by a newer refresh only to do the same work twice.
+
     A peer wedged in 'processing' holds its key until claim recovery releases
     it, the same caveat ``bank_serialization_sql`` carries and the same general
     gap.
@@ -142,7 +149,6 @@ def key_serialization_sql(table: str, alias: str) -> str:
                   doc_peer.status = 'processing'
                   OR (doc_peer.status = 'pending'
                       AND doc_peer.task_payload IS NOT NULL
-                      AND (doc_peer.next_retry_at IS NULL OR doc_peer.next_retry_at <= NOW())
                       AND (doc_peer.created_at < {alias}.created_at
                            OR (doc_peer.created_at = {alias}.created_at
                                AND doc_peer.operation_id < {alias}.operation_id)))

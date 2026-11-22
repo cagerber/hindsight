@@ -521,6 +521,34 @@ async def test_claim_waits_for_a_processing_peer(backend, bank):
     assert _own(rows, bank) == [], "a document with a retain in flight must yield nothing"
 
 
+@pytest.mark.asyncio
+async def test_claim_waits_for_an_older_peer_in_retry_backoff(backend, bank):
+    """A retried append keeps its place in line while it waits out its backoff.
+
+    The older append failed and was rescheduled; the newer one must not run first,
+    or the retried turns land after turns that were submitted later.
+    """
+    first = await _insert_retain_op(backend, bank, "doc-a", contents=[{"content": "one"}])
+    second = await _insert_retain_op(backend, bank, "doc-a", contents=[{"content": "two"}])
+    async with backend.acquire() as conn:
+        await conn.execute(
+            "UPDATE async_operations SET next_retry_at = now() + interval '1 hour' WHERE operation_id = $1",
+            uuid.UUID(first),
+        )
+
+    rows = await _claiming(backend, lambda conn: _claim_rows(backend, conn, "w1"))
+    assert second not in _own(rows, bank), "a newer append must not overtake an older one in retry backoff"
+    assert _own(rows, bank) == []
+
+    async with backend.acquire() as conn:
+        await conn.execute(
+            "UPDATE async_operations SET next_retry_at = now() - interval '1 second' WHERE operation_id = $1",
+            uuid.UUID(first),
+        )
+    rows = await _claiming(backend, lambda conn: _claim_rows(backend, conn, "w2"))
+    assert _own(rows, bank) == [first], "once its backoff ends the older append runs first, alone"
+
+
 async def _insert_refresh_op(pool, bank_id: str, mental_model_id: str) -> str:
     """Queue a pending refresh, as submit_async_refresh_mental_model would.
 
