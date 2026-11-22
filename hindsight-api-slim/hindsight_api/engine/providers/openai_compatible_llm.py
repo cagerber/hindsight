@@ -921,6 +921,7 @@ class OpenAICompatibleLLM(LLMInterface):
         default_headers: dict[str, str] | None = None,
         cache_affinity: str | None = None,
         ollama_num_ctx: int | None = None,
+        batch_base_url: str | None = None,
         **kwargs: Any,
     ):
         """
@@ -943,6 +944,11 @@ class OpenAICompatibleLLM(LLMInterface):
                 from the provider + base-URL host). See ``engine/cache_affinity.py``.
             ollama_num_ctx: Native Ollama context window override. None lets Ollama use
                 the model/server default.
+            batch_base_url: Base URL for Batch API calls (``/v1/files``,
+                ``/v1/batches``). Most vendors serve the Batch API on the same host as
+                chat, so the default (None) reuses ``base_url``; vendors that split the
+                two (Xiaomi MiMo) set this to the batch host. Trailing slashes are
+                stripped and an empty string means None.
             **kwargs: Additional provider-specific parameters.
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
@@ -1070,6 +1076,14 @@ class OpenAICompatibleLLM(LLMInterface):
             client_kwargs["timeout"] = build_sdk_timeout(self.timeout)
 
         self._client = AsyncOpenAI(**client_kwargs)
+        # Kept so the Batch API client (host may differ from the chat host) can be
+        # built from the identical kwargs — same key, headers and timeout — with
+        # only base_url swapped. See _batch_client().
+        self._client_kwargs = client_kwargs
+        # Batch API host, when the vendor splits it from the chat host (Xiaomi MiMo).
+        # Empty means None so truthiness alone distinguishes "not configured".
+        self._batch_base_url = (batch_base_url or "").rstrip("/") or None
+        self._batch_client_instance: AsyncOpenAI | None = None
         # Ollama's native /api/chat is not reachable through the SDK, so that path
         # talks HTTP itself (see _call_ollama_native). Lazily created per loop.
         #
@@ -2066,6 +2080,28 @@ class OpenAICompatibleLLM(LLMInterface):
         """
         return True if self.provider == "openai" else None
 
+    def _batch_client(self) -> AsyncOpenAI:
+        """Client for Batch API calls (``/v1/files``, ``/v1/batches``).
+
+        Most OpenAI-compatible vendors serve chat and the Batch API on one host, so
+        with no ``batch_base_url`` configured this is exactly the chat client and
+        nothing changes. Vendors that split them (Xiaomi MiMo serves chat and batch on
+        different hosts) get a second client built lazily from the same assembled
+        kwargs with only ``base_url`` replaced, so the API key, headers and timeout
+        still apply verbatim.
+        """
+        if not self._batch_base_url:
+            return self._client
+        if self._batch_client_instance is None:
+            batch_kwargs = dict(self._client_kwargs)
+            batch_kwargs["base_url"] = self._batch_base_url
+            # default_query was derived from the *chat* URL's query string (Azure's
+            # api-version), so carrying it onto a different host would send another
+            # vendor's parameters to the batch endpoint.
+            batch_kwargs.pop("default_query", None)
+            self._batch_client_instance = AsyncOpenAI(**batch_kwargs)
+        return self._batch_client_instance
+
     async def supports_batch_api(self) -> bool:
         """Check if this provider supports batch API operations."""
         # Only OpenAI and Groq support batch API
@@ -2088,10 +2124,10 @@ class OpenAICompatibleLLM(LLMInterface):
         file_bytes = io.BytesIO(jsonl_content.encode("utf-8"))
         file_bytes.name = "batch_input.jsonl"  # OpenAI SDK needs a filename
 
-        file_response = await self._client.files.create(file=file_bytes, purpose="batch")
+        file_response = await self._batch_client().files.create(file=file_bytes, purpose="batch")
         logger.debug(f"Uploaded batch file: {file_response.id}")
 
-        batch_response = await self._client.batches.create(
+        batch_response = await self._batch_client().batches.create(
             input_file_id=file_response.id,
             endpoint=OPENAI_BATCH_ENDPOINT,
             completion_window="24h",
@@ -2104,7 +2140,7 @@ class OpenAICompatibleLLM(LLMInterface):
         if not await self.supports_batch_api():
             raise NotImplementedError(f"Batch API not supported for provider: {self.provider}")
 
-        batch = await self._client.batches.retrieve(batch_id)
+        batch = await self._batch_client().batches.retrieve(batch_id)
         counts = batch.request_counts
         return BatchStatus(
             batch_id=batch.id,
@@ -2122,14 +2158,14 @@ class OpenAICompatibleLLM(LLMInterface):
         if not await self.supports_batch_api():
             raise NotImplementedError(f"Batch API not supported for provider: {self.provider}")
 
-        batch = await self._client.batches.retrieve(batch_id)
+        batch = await self._batch_client().batches.retrieve(batch_id)
         if batch.status != "completed":
             raise ValueError(f"Batch {batch_id} is not completed yet (status: {batch.status})")
         if not batch.output_file_id:
             raise ValueError(f"Batch {batch_id} has no output file")
 
         logger.debug(f"Downloading results for batch {batch_id} from file {batch.output_file_id}")
-        file_content = await self._client.files.content(batch.output_file_id)
+        file_content = await self._batch_client().files.content(batch.output_file_id)
 
         results = []
         for line in file_content.text.strip().split("\n"):
@@ -2147,6 +2183,9 @@ class OpenAICompatibleLLM(LLMInterface):
         """Clean up resources (close OpenAI client connections)."""
         if hasattr(self, "_client") and self._client:
             await self._client.close()
+        # Only exists when batch_base_url was configured and a batch call was made.
+        if getattr(self, "_batch_client_instance", None):
+            await self._batch_client_instance.close()
         if hasattr(self, "_ollama_http"):
             await self._ollama_http.close()
 

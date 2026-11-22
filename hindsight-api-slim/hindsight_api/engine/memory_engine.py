@@ -940,6 +940,7 @@ def _member_to_llm(member: "LLMMemberConfig", config: ConfigLike, defaults: _LLM
         extra_body=member.extra_body,
         default_headers=member.default_headers or config.llm_default_headers,
         cache_affinity=member.cache_affinity or config.llm_cache_affinity,
+        batch_base_url=member.batch_base_url or config.llm_batch_base_url,
         ollama_num_ctx=config.llm_ollama_num_ctx,
         bedrock_service_tier=member.bedrock_service_tier,
         structured_output_in_prompt=config.llm_structured_output_in_prompt,
@@ -3252,6 +3253,7 @@ class MemoryEngine(MemoryEngineInterface):
             extra_body=config.retain_llm_extra_body or config.llm_extra_body,
             default_headers=config.llm_default_headers,
             cache_affinity=config.retain_llm_cache_affinity or config.llm_cache_affinity,
+            batch_base_url=config.retain_llm_batch_base_url or config.llm_batch_base_url,
             ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.retain_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
@@ -3307,6 +3309,7 @@ class MemoryEngine(MemoryEngineInterface):
                 cache_affinity=config.vlm_cache_affinity
                 or config.retain_llm_cache_affinity
                 or config.llm_cache_affinity,
+                batch_base_url=config.retain_llm_batch_base_url or config.llm_batch_base_url,
                 ollama_num_ctx=config.llm_ollama_num_ctx,
                 bedrock_service_tier=config.llm_bedrock_service_tier,
                 structured_output_in_prompt=config.llm_structured_output_in_prompt,
@@ -3485,6 +3488,7 @@ class MemoryEngine(MemoryEngineInterface):
             extra_body=config.consolidation_llm_extra_body or config.llm_extra_body,
             default_headers=config.llm_default_headers,
             cache_affinity=config.consolidation_llm_cache_affinity or config.llm_cache_affinity,
+            batch_base_url=config.llm_batch_base_url,
             ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.consolidation_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,

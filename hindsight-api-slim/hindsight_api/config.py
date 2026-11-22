@@ -170,6 +170,10 @@ ENV_LLM_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
 ENV_LLM_API_KEY = "HINDSIGHT_API_LLM_API_KEY"
 ENV_LLM_MODEL = "HINDSIGHT_API_LLM_MODEL"
 ENV_LLM_BASE_URL = "HINDSIGHT_API_LLM_BASE_URL"
+# Batch API host for the OpenAI-compatible provider, when the vendor serves chat
+# and the Batch API (/v1/files, /v1/batches) on different hosts (Xiaomi MiMo).
+# Unset means the Batch API uses base_url, the historical behaviour.
+ENV_LLM_BATCH_BASE_URL = "HINDSIGHT_API_LLM_BATCH_BASE_URL"
 ENV_LLM_MAX_CONCURRENT = "HINDSIGHT_API_LLM_MAX_CONCURRENT"
 ENV_LLM_MAX_RETRIES = "HINDSIGHT_API_LLM_MAX_RETRIES"
 ENV_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_LLM_INITIAL_BACKOFF"
@@ -482,6 +486,8 @@ ENV_RETAIN_LLM_PROVIDER = "HINDSIGHT_API_RETAIN_LLM_PROVIDER"
 ENV_RETAIN_LLM_API_KEY = "HINDSIGHT_API_RETAIN_LLM_API_KEY"
 ENV_RETAIN_LLM_MODEL = "HINDSIGHT_API_RETAIN_LLM_MODEL"
 ENV_RETAIN_LLM_BASE_URL = "HINDSIGHT_API_RETAIN_LLM_BASE_URL"
+# Retain-role override of ENV_LLM_BATCH_BASE_URL (see that constant).
+ENV_RETAIN_LLM_BATCH_BASE_URL = "HINDSIGHT_API_RETAIN_LLM_BATCH_BASE_URL"
 
 # The vision slot. Extraction uses these ONLY for a chunk that actually carries
 # an attachment, falling back to the retain LLM (and then the base LLM) when
@@ -3020,6 +3026,9 @@ class LLMMemberConfig:
     bedrock_service_tier: str | None = None
     gemini_service_tier: str | None = None
     cache_affinity: str | None = None
+    # Batch API host for this member (see ENV_LLM_BATCH_BASE_URL). None falls back
+    # to the global llm_batch_base_url, mirroring cache_affinity.
+    batch_base_url: str | None = None
     codex_home: str | None = None
     vertexai_project_id: str | None = None
     vertexai_region: str | None = None
@@ -3189,6 +3198,7 @@ def _parse_llm_members(prefix: str) -> list[LLMMemberConfig]:
                 extra_body=json.loads(os.getenv(base + "EXTRA_BODY", "null")),
                 default_headers=json.loads(os.getenv(base + "DEFAULT_HEADERS", "null")),
                 cache_affinity=os.getenv(base + "CACHE_AFFINITY") or None,
+                batch_base_url=os.getenv(base + "BATCH_BASE_URL") or None,
                 bedrock_service_tier=os.getenv(base + "BEDROCK_SERVICE_TIER") or None,
                 gemini_service_tier=(
                     parse_gemini_service_tier(gemini_service_tier) if provider.lower() == "gemini" else None
@@ -3678,6 +3688,9 @@ class HindsightConfig:
     llm_api_key: str | None
     llm_model: str
     llm_base_url: str | None
+    # Batch API host for the OpenAI-compatible providers when the vendor splits it
+    # from the chat host (Xiaomi MiMo). None keeps the Batch API on llm_base_url.
+    llm_batch_base_url: str | None
     llm_max_concurrent: int
     llm_max_retries: int
     llm_initial_backoff: float
@@ -3796,6 +3809,9 @@ class HindsightConfig:
     retain_llm_api_key: str | None
     retain_llm_model: str | None
     retain_llm_base_url: str | None
+    # Retain-role override of llm_batch_base_url (None falls back to the global one
+    # at the LLMConfig construction site, like the other retain_llm_* values).
+    retain_llm_batch_base_url: str | None
 
     # Vision slot, used only for chunks carrying an attachment. Each falls back
     # to the corresponding retain_llm_* value, so leaving these unset reproduces
@@ -4541,7 +4557,9 @@ class HindsightConfig:
         "reranker_members",
         # Base URLs (could expose infrastructure)
         "llm_base_url",
+        "llm_batch_base_url",
         "retain_llm_base_url",
+        "retain_llm_batch_base_url",
         "vlm_base_url",
         "reflect_llm_base_url",
         "consolidation_llm_base_url",
@@ -5147,6 +5165,7 @@ class HindsightConfig:
             llm_api_key=os.getenv(ENV_LLM_API_KEY),
             llm_model=llm_model,
             llm_base_url=os.getenv(ENV_LLM_BASE_URL) or None,
+            llm_batch_base_url=os.getenv(ENV_LLM_BATCH_BASE_URL) or None,
             llm_max_concurrent=int(os.getenv(ENV_LLM_MAX_CONCURRENT, str(DEFAULT_LLM_MAX_CONCURRENT))),
             llm_max_retries=int(os.getenv(ENV_LLM_MAX_RETRIES, str(DEFAULT_LLM_MAX_RETRIES))),
             llm_initial_backoff=float(os.getenv(ENV_LLM_INITIAL_BACKOFF, str(DEFAULT_LLM_INITIAL_BACKOFF))),
@@ -5239,6 +5258,7 @@ class HindsightConfig:
             retain_llm_api_key=os.getenv(ENV_RETAIN_LLM_API_KEY) or None,
             retain_llm_model=os.getenv(ENV_RETAIN_LLM_MODEL) or _env_default_model(ENV_RETAIN_LLM_PROVIDER),
             retain_llm_base_url=os.getenv(ENV_RETAIN_LLM_BASE_URL) or None,
+            retain_llm_batch_base_url=os.getenv(ENV_RETAIN_LLM_BATCH_BASE_URL) or None,
             vlm_provider=os.getenv(ENV_VLM_PROVIDER) or None,
             vlm_api_key=os.getenv(ENV_VLM_API_KEY) or None,
             vlm_model=os.getenv(ENV_VLM_MODEL) or _env_default_model(ENV_VLM_PROVIDER),
