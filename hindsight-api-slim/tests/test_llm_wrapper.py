@@ -396,37 +396,80 @@ def test_llm_provider_threads_batch_base_url_to_provider_impl():
     assert provider._provider_impl._batch_base_url == "https://batch.example/v1"
 
 
-def test_openai_compatible_batch_client_uses_configured_host():
-    """Batch calls go to the batch host; chat stays on base_url."""
+@pytest.mark.asyncio
+async def test_openai_compatible_batch_over_http_on_batch_host_sends_name():
+    """With a batch host the Batch API is plain HTTP there, carries the vendor's ``name``, and chat is untouched."""
+    import json as _json
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from hindsight_api.engine.llm_interface import BatchRequest
     from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
 
-    llm = OpenAICompatibleLLM(
-        provider="openai",
-        api_key="sk-test",
-        base_url="https://chat.example/v1",
-        model="gpt-4o-mini",
-        batch_base_url="https://batch.example/v1/",
-    )
+    seen: list[tuple[str, str, object]] = []
 
-    batch_client = llm._batch_client()
-    assert batch_client is not llm._client
-    assert llm._batch_client() is batch_client  # created lazily, once
-    assert str(batch_client.base_url).rstrip("/") == "https://batch.example/v1"
-    assert str(llm._client.base_url).rstrip("/") == "https://chat.example/v1"
+    async def upload(request):
+        seen.append(("POST", "/v1/files", request.headers.get("Authorization")))
+        await request.post()
+        return web.json_response({"id": "file-1"})
+
+    async def create(request):
+        body = await request.json()
+        seen.append(("POST", "/v1/batches", body))
+        return web.json_response({"id": "batch-1", "status": "validating"})
+
+    async def retrieve(request):
+        return web.json_response(
+            {
+                "id": "batch-1",
+                "status": "completed",
+                "output_file_id": "out-1",
+                "request_counts": {"total": 1, "completed": 1},
+            }
+        )
+
+    async def content(request):
+        line = {"custom_id": "c1", "response": {"body": {"choices": [{"message": {"content": "hi"}}]}}}
+        return web.Response(text=_json.dumps(line) + "\n")
+
+    app = web.Application()
+    app.router.add_post("/v1/files", upload)
+    app.router.add_post("/v1/batches", create)
+    app.router.add_get("/v1/batches/batch-1", retrieve)
+    app.router.add_get("/v1/files/out-1/content", content)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        llm = OpenAICompatibleLLM(
+            provider="openai",
+            api_key="sk-test",
+            base_url="https://chat.invalid/v1",
+            model="m",
+            batch_base_url=f"http://127.0.0.1:{server.port}/v1/",
+        )
+        submission = await llm.submit_batch([BatchRequest(custom_id="c1", body={"model": "m", "messages": []})])
+        assert submission.batch_id == "batch-1"
+        assert seen[0] == ("POST", "/v1/files", "Bearer sk-test")
+        assert seen[1][2]["name"] == "hindsight-openai-batch"
+        assert seen[1][2]["input_file_id"] == "file-1"
+
+        status = await llm.get_batch_status("batch-1")
+        assert status.status == "completed" and status.request_counts.completed == 1
+        results = await llm.retrieve_batch_results("batch-1")
+        assert [r.custom_id for r in results] == ["c1"]
+        await llm.cleanup()
+    finally:
+        await server.close()
 
 
-def test_openai_compatible_batch_client_defaults_to_chat_client():
-    """No batch_base_url keeps the historical single-client behaviour."""
+def test_openai_compatible_batch_without_batch_host_keeps_sdk_path():
+    """No batch_base_url: no HTTP-driven batch path is configured (the SDK client serves batch)."""
     from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
 
-    llm = OpenAICompatibleLLM(
-        provider="openai",
-        api_key="sk-test",
-        base_url="https://chat.example/v1",
-        model="gpt-4o-mini",
-    )
+    llm = OpenAICompatibleLLM(provider="openai", api_key="sk-test", base_url="https://chat.example/v1", model="m")
 
-    assert llm._batch_client() is llm._client
+    assert llm._batch_base_url is None
 
 
 def test_config_reads_batch_base_url_env(monkeypatch):

@@ -3038,6 +3038,17 @@ async def _write_batch_extraction_errors(
         )
 
 
+class BatchSubmitError(RuntimeError):
+    """The batch job could not be *submitted* — nothing was queued upstream.
+
+    Raised only for failures that happen before a batch_id exists, so the caller can
+    safely fall back to real-time extraction: an unsubmitted batch has no results
+    coming, so re-extracting cannot duplicate anything. Failures after submission
+    (polling, result retrieval) deliberately do not use this type — falling back
+    there could double-write facts the batch is still going to produce.
+    """
+
+
 async def extract_facts_from_contents_batch_api(
     contents: list[RetainContent],
     llm_config,
@@ -3195,7 +3206,13 @@ async def extract_facts_from_contents_batch_api(
     if not batch_id:
         logger.info(f"Submitting batch with {len(batch_requests)} chunk requests")
 
-        submission = await batch_impl.submit_batch(batch_requests)
+        try:
+            submission = await batch_impl.submit_batch(batch_requests)
+        except Exception as exc:
+            # Nothing was queued upstream: no batch_id exists and no state has been
+            # persisted yet, so the caller may fall back to real-time extraction
+            # without risking duplicate facts.
+            raise BatchSubmitError(f"{type(exc).__name__}: {exc}") from exc
         batch_id = submission.batch_id
 
         logger.info(f"Batch submitted: {batch_id}, polling every {config.retain_batch_poll_interval_seconds}s")
@@ -3729,7 +3746,14 @@ async def extract_facts_from_contents(
 
     # Route to batch API if enabled
     if config.retain_batch_enabled:
-        return await extract_facts_from_contents_batch_api(contents, llm_config, config, pool, operation_id, schema)
+        try:
+            return await extract_facts_from_contents_batch_api(contents, llm_config, config, pool, operation_id, schema)
+        except BatchSubmitError as exc:
+            # The provider would not accept the job — Xiaomi MiMo's /v1/batches
+            # currently 500s for every payload, for instance. Extract in real time
+            # rather than failing the retain: correctness first, and the batch route
+            # starts working by itself once the provider accepts submissions.
+            logger.warning("Batch retain submission failed (%s); falling back to real-time extraction", exc)
 
     extraction_prompt = _build_extraction_prompt_and_schema(config)
 
