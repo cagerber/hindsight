@@ -13,7 +13,7 @@
  * without stdin; `runRetainHook` is thin plumbing around it, mirroring `runHook`/`buildHookOutput`
  * in core/hook.ts.
  */
-import { deriveBankIdOrSkip } from "./bank";
+import { deriveBankIdOrSkip, directoryAnchorsBank } from "./bank";
 import { retainLiveSession } from "./chat";
 import { applyBankConfig, loadConfig } from "./config";
 import { DAEMON_WAIT_RETAIN_MS, ensureDaemon } from "./daemon";
@@ -218,7 +218,16 @@ export async function runRetainHook(
   if (!transcriptPath) return;
 
   const sessionRoot = sessionRootDir(spec.harness, sessionId, cwd);
-  const derived = deriveBankIdOrSkip(cfg, cwd, spec.harness, sessionRoot);
+  // A session already writing to a bank stays there while the agent is only visiting a directory
+  // that names no project (`~`, `/tmp`, a tool's state folder): such a directory gets a bank only by
+  // falling back to the starting directory's name, and following it would flip the session between
+  // that fallback bank and every repo it works in, re-sending the whole conversation on each flip.
+  // Moving INTO a mapped directory or a repository still moves the session (#5812).
+  const stayIn = directoryAnchorsBank(cfg, cwd)
+    ? undefined
+    : fileCursorStore(spec.harness).read(sessionId || "no-session")?.bank;
+  if (stayIn) diag(spec.harness, "bank_kept", { bank: stayIn, cwd, session: sessionId });
+  const derived = stayIn ?? deriveBankIdOrSkip(cfg, cwd, spec.harness, sessionRoot);
   // Skipping the write-back loses this session; retaining it into a guessed bank loses it AND
   // pollutes the server with a bank nothing ever reads back (#3950).
   if (derived === null) return;

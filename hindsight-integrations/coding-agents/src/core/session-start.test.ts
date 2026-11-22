@@ -4,13 +4,22 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
-import { buildSessionStartContext, runSessionStartHook } from "./session-start";
+import {
+  buildSessionStartContext,
+  runSessionStartHook,
+  SURVEY_FINDINGS_GRACE_MS,
+} from "./session-start";
 import { startCodebaseSurvey, SURVEY_MAX_ATTEMPTS } from "./survey";
 import { releaseLease, SURVEY_SPEC_ENV } from "./survey-lease";
+import { surveyBaselinePath } from "./survey-baselines";
 import { resolveConfig } from "./config";
 import { repoNameOf } from "./git";
 import { HOOK_HARNESSES } from "../harness/hook-lifecycle";
 import type { RawConfig } from "./config";
+
+// The local survey-baseline journal is a file shared by every test in the run; start each test
+// without one so a baseline recorded by one test cannot satisfy another's re-survey check.
+beforeEach(() => rmSync(surveyBaselinePath(), { force: true }));
 
 /** The SessionStart event `runSessionStartHook` reads from fd 0; every other read stays real. */
 let stdin = "";
@@ -792,11 +801,74 @@ describe("buildSessionStartContext — survey attempt limit (#5623)", () => {
           startSurvey,
           headSha: () => "bbb",
           commitsSince: () => 1,
+          // No local journal: this exercises the per-commit cap alone, as on a machine whose
+          // only evidence of the earlier surveys is the bank's marker.
+          surveyBaselines: { read: () => [], record: () => {} },
         });
       for (let i = 0; i < SURVEY_MAX_ATTEMPTS + 2; i++) await session();
       expect(spawn).toHaveBeenCalledTimes(SURVEY_MAX_ATTEMPTS);
     } finally {
       rmSync(leaseDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("buildSessionStartContext — survey baseline still in the retain queue", () => {
+  // The bank's baseline marker and the survey's findings are queued retains; while the queue is
+  // backlogged neither exists yet. 28 surveys of one repository in a day came from this.
+  const warmClient = (uploads: Set<string>) => ({
+    listDocumentIds: async (tag: string) =>
+      tag === "source:survey-baseline"
+        ? new Set(["survey-baseline:old"]) // only the PREVIOUS survey's marker has landed
+        : tag === "source:upload"
+          ? uploads
+          : new Set(["git:abc"]),
+    listPages: async () => ({ items: [] }),
+    retain: vi.fn().mockResolvedValue({}), // accepted into the queue, never extracted
+  });
+  const session = (
+    startSurvey: typeof startCodebaseSurvey,
+    uploads: Set<string>,
+    journal?: Parameters<typeof buildSessionStartContext>[0]["surveyBaselines"]
+  ) =>
+    buildSessionStartContext({
+      cwd: "/tmp/x",
+      bankId: "bank-queue-lag",
+      cfg: resolveConfig({ surveyRefreshCommits: 20 }),
+      client: warmClient(uploads),
+      hasGit: () => true,
+      startSeed: vi.fn(),
+      startSurvey,
+      headSha: () => "new",
+      commitsSince: (_dir, sha) => (sha === "old" ? 60 : 0), // 60 commits since the old survey
+      surveyBaselines: journal,
+    });
+
+  it("does not re-survey while the new baseline marker is still queued", async () => {
+    const startSurvey = vi.fn().mockResolvedValue(true);
+    const findings = new Set(["repository-component-map"]);
+    for (let i = 0; i < 3; i++) await session(startSurvey, findings);
+    expect(startSurvey).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for queued findings before treating the survey as crashed", async () => {
+    const startSurvey = vi.fn().mockResolvedValue(true);
+    let now = Date.parse("2026-11-22T00:00:00Z");
+    const entries: { sha: string; at: number }[] = [];
+    const journal = {
+      read: () => entries,
+      record: (_bank: string, sha: string) => void entries.push({ sha, at: now }),
+    };
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await session(startSurvey, new Set(), journal); // threshold crossed: survey 1
+      await session(startSurvey, new Set(), journal); // findings still queued: no retry
+      expect(startSurvey).toHaveBeenCalledTimes(1);
+      now += SURVEY_FINDINGS_GRACE_MS; // a day on and still nothing: the survey died
+      await session(startSurvey, new Set(), journal);
+      expect(startSurvey).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.restoreAllMocks();
     }
   });
 });

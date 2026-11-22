@@ -376,6 +376,23 @@ export function bankProjectName(
 }
 
 /**
+ * Whether `directory` names a project ON ITS OWN: it is under a `mapPathToBank` entry, or inside a
+ * git repository (or git could not tell — a failed probe is left to `deriveBankIdOrSkip`).
+ *
+ * A directory that does neither — the home directory, `/tmp`, a tool's state folder — only gets a
+ * bank by falling back to the session's starting directory name. The retain hook uses this to keep
+ * a session that is already writing to a bank where it is when the agent merely visits such a
+ * directory: without it, a session started in `~` flips between `{home}` and every repo it works in,
+ * re-sending its whole conversation to each bank on every flip.
+ */
+export function directoryAnchorsBank(config: BankConfig, directory: string): boolean {
+  if (!directory) return false;
+  const pathMap = config.mapPathToBank;
+  if (pathMap && mapLookup(pathMap, normalize(directory)) !== undefined) return true;
+  return resolveProjectRoot(nearestExistingDir(directory)).status !== "absent";
+}
+
+/**
  * `deriveBankId`, or null when the repository could not be identified — with a `warn` and a diag
  * event so the miss is diagnosable in minutes rather than by cross-referencing bank creation
  * timestamps against a log file.

@@ -26,6 +26,11 @@ import { startBackgroundSeed } from "./seed";
 import { maybeAutoUpdate } from "./auto-update";
 import { syncCompanionSkill } from "./skill-sync";
 import { SURVEY_DOC_IDS, startCodebaseSurvey, type SurveyHarness } from "./survey";
+import { fileSurveyBaselineJournal, type SurveyBaselineJournal } from "./survey-baselines";
+
+/** How long after starting a survey its findings may still be sitting in the retain queue before
+ *  their absence is taken to mean the survey died. */
+export const SURVEY_FINDINGS_GRACE_MS = 24 * 60 * 60 * 1000;
 import { applyBankConfig, loadConfig } from "./config";
 import { DAEMON_WAIT_SESSION_START_MS, ensureDaemon } from "./daemon";
 import type { Config } from "./config";
@@ -182,6 +187,8 @@ export async function buildSessionStartContext(args: {
   startSurvey?: typeof startCodebaseSurvey;
   headSha?: (dir: string) => string | null;
   commitsSince?: (dir: string, sinceSha: string) => number | null;
+  /** Local record of survey baselines; defaults to a file beside the retain cursors. */
+  surveyBaselines?: SurveyBaselineJournal;
   /** Registry key of the old Claude Code plugin still active for `cwd`; defaults to reading
    *  Claude's plugin files, and only for the claude-code harness. */
   detectLegacyPlugin?: (cwd: string) => string | undefined;
@@ -208,7 +215,17 @@ export async function buildSessionStartContext(args: {
   // marker. The commit-count re-survey reads these back by tag.
   const SURVEY_BASELINE_TAG = "source:survey-baseline";
   const SURVEY_BASELINE_PREFIX = "survey-baseline:";
+  const localBaselines = args.surveyBaselines ?? fileSurveyBaselineJournal();
+  // Bank markers plus this machine's journal: the bank's marker is only a document once the retain
+  // queue has extracted it, and until then the journal is what stops the next session from
+  // launching the same survey again (see survey-baselines.ts).
+  const withLocalBaselines = (fromBank: Set<string> | undefined): Set<string> | undefined => {
+    const local = localBaselines.read(bankId);
+    if (!local.length) return fromBank;
+    return new Set([...(fromBank ?? []), ...local.map((e) => `${SURVEY_BASELINE_PREFIX}${e.sha}`)]);
+  };
   const recordSurveyBaseline = (sha: string): void => {
+    localBaselines.record(bankId, sha);
     if (!client.retain) return; // minimal client (some tests) — nothing to record
     try {
       const stamp = retainStamp();
@@ -260,6 +277,9 @@ export async function buildSessionStartContext(args: {
           baselines = await client
             .listDocumentIds(SURVEY_BASELINE_TAG, "all_strict")
             .catch(() => undefined);
+          // A journal entry alone proves a survey was started here; with the bank unreadable it
+          // still leaves `cold` to the git answer below, which is already undefined.
+          if (baselines !== undefined) baselines = withLocalBaselines(baselines);
         }
         cold = docIds !== undefined ? docIds.size === 0 && !baselines?.size : undefined;
         gitDocIds = docIds;
@@ -310,9 +330,12 @@ export async function buildSessionStartContext(args: {
             if (sha) {
               const markers =
                 baselines ??
-                (await client
-                  .listDocumentIds(SURVEY_BASELINE_TAG, "all_strict")
-                  .catch(() => new Set<string>()));
+                withLocalBaselines(
+                  await client
+                    .listDocumentIds(SURVEY_BASELINE_TAG, "all_strict")
+                    .catch(() => new Set<string>())
+                ) ??
+                new Set<string>();
               const counts: number[] = [];
               for (const id of markers) {
                 if (!id.startsWith(SURVEY_BASELINE_PREFIX)) continue;
@@ -325,8 +348,15 @@ export async function buildSessionStartContext(args: {
               const uploads = await client
                 .listDocumentIds("source:upload", "all_strict")
                 .catch(() => new Set<string>());
+              // The findings are queued retains too, so a survey that DID finish reads as absent
+              // until the queue reaches them. Retry only once the last local start is old enough
+              // that its findings should have landed; a bank-only marker (no local entry) keeps
+              // the old behaviour.
+              const lastLocalStart = Math.max(0, ...localBaselines.read(bankId).map((e) => e.at));
               const findingsAbsent =
-                counts.length > 0 && !SURVEY_DOC_IDS.some((id) => uploads.has(id));
+                counts.length > 0 &&
+                !SURVEY_DOC_IDS.some((id) => uploads.has(id)) &&
+                Date.now() - lastLocalStart >= SURVEY_FINDINGS_GRACE_MS;
               if ((sinceLast !== null && sinceLast >= cfg.surveyRefreshCommits) || findingsAbsent) {
                 const started = await startSurvey(cwd, {
                   harness: harness as SurveyHarness,

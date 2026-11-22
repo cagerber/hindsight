@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { PageRef } from "./page-injection";
 import type { RetainCursor, RetainCursorStore } from "./retain-cursor";
@@ -179,8 +179,22 @@ export function fileUsageCursorStore(harness: string): UsageCursorStore {
   };
 }
 
+/** Where retain cursors live: a durable directory, NOT the temp dir. A cursor lost to a reboot or
+ *  temp cleanup makes the next write-back of EVERY live session a full replace — the whole
+ *  transcript re-sent and re-chunked — so on a machine with many long sessions one reboot queued
+ *  hundreds of full copies. `HINDSIGHT_CURSOR_DIR` overrides; default `~/.hindsight/state/cursors`. */
+export function cursorRoot(): string {
+  return process.env.HINDSIGHT_CURSOR_DIR || join(homedir(), ".hindsight", "state", "cursors");
+}
+
 /** The cursor's own file, deliberately NOT the shared session cache — see fileCursorStore. */
 function cursorFile(harness: string, sessionId: string): string {
+  return join(cursorRoot(), `hindsight-${harness}`, `${sessionId}.retain.json`);
+}
+
+/** Where cursors lived before they moved out of the temp dir: read once as a fallback so sessions
+ *  already in flight across the upgrade keep appending instead of replacing. */
+function legacyCursorFile(harness: string, sessionId: string): string {
   return join(tmpdir(), `hindsight-${harness}`, `${sessionId}.retain.json`);
 }
 
@@ -202,11 +216,14 @@ function cursorFile(harness: string, sessionId: string): string {
 export function fileCursorStore(harness: string): RetainCursorStore {
   return {
     read: (sessionId) => {
-      try {
-        return JSON.parse(readFileSync(cursorFile(harness, sessionId), "utf8")) as RetainCursor;
-      } catch {
-        return undefined;
+      for (const file of [cursorFile(harness, sessionId), legacyCursorFile(harness, sessionId)]) {
+        try {
+          return JSON.parse(readFileSync(file, "utf8")) as RetainCursor;
+        } catch {
+          /* try the next location */
+        }
       }
+      return undefined;
     },
     write: (sessionId, cursor) => {
       try {

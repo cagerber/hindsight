@@ -176,10 +176,20 @@ export const MAX_CURSOR_OPS = 8;
  * changed. Hashing the whole prefix costs O(prefix) per retain, far less than the replace it avoids
  * — the same bytes through a digest instead of over the network — and it streams, so nothing here
  * materializes a second copy of the transcript.
+ *
+ * Only role and content are hashed, not the timestamp. When a Stop hook fires, the host has usually
+ * not flushed the final reply yet, so the hook adds it from the event with the hook's own clock as
+ * its timestamp. On the next Stop the transcript carries the same reply with the host's timestamp,
+ * a few milliseconds earlier. Hashing the timestamp made that prefix look rewritten on every turn,
+ * and each write-back then replaced the whole conversation instead of appending to it. An edited or
+ * redacted turn changes its content, so it is still caught.
  */
 export function fingerprintTurns(turns: TransportTurn[], count: number): string {
   const h = createHash("sha1").update(String(count));
-  for (let i = 0; i < count; i++) h.update("\n" + JSON.stringify(turns[i]));
+  for (let i = 0; i < count; i++) {
+    const { role, content } = turns[i];
+    h.update("\n" + JSON.stringify({ role, content }));
+  }
   return h.digest("hex");
 }
 

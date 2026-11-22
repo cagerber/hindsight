@@ -1,6 +1,9 @@
-import { rmSync } from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
+  cursorRoot,
   fileCursorStore,
   readSessionCache,
   sessionCacheFile,
@@ -10,8 +13,13 @@ import {
 
 const HARNESS = "codex-cursor-test";
 const sessions = ["s1", "s2"];
+// Cursors live under the home dir by default; never let a test write there.
+const CURSOR_DIR = mkdtempSync(join(tmpdir(), "hs-cursor-test-"));
+process.env.HINDSIGHT_CURSOR_DIR = CURSOR_DIR;
+afterAll(() => rmSync(CURSOR_DIR, { recursive: true, force: true }));
 
 afterEach(() => {
+  rmSync(join(CURSOR_DIR, `hindsight-${HARNESS}`), { recursive: true, force: true });
   for (const s of sessions) {
     rmSync(sessionCacheFile(HARNESS, s), { force: true });
     rmSync(sessionCacheFile(HARNESS, s).replace(/\.json$/, ".retain.json"), { force: true });
@@ -45,6 +53,19 @@ describe("fileCursorStore", () => {
     store.write("s2", { turns: 9, fingerprint: "b", bank: "b1" });
     expect(store.read("s1")).toEqual({ turns: 1, fingerprint: "a", bank: "b1" });
     expect(store.read("s2")).toEqual({ turns: 9, fingerprint: "b", bank: "b1" });
+  });
+
+  it("keeps cursors out of the temp dir, so a reboot does not force a full resend", () => {
+    fileCursorStore(HARNESS).write("s1", { turns: 3, fingerprint: "x", bank: "b1" });
+    expect(cursorRoot()).toBe(CURSOR_DIR);
+    expect(fileCursorStore(HARNESS).read("s1")?.turns).toBe(3);
+  });
+
+  it("still reads a cursor left in the temp dir by an older version", () => {
+    const legacy = sessionCacheFile(HARNESS, "s2").replace(/\.json$/, ".retain.json");
+    mkdirSync(join(legacy, ".."), { recursive: true });
+    writeFileSync(legacy, JSON.stringify({ turns: 7, fingerprint: "old", bank: "b1" }));
+    expect(fileCursorStore(HARNESS).read("s2")?.turns).toBe(7);
   });
 
   it("reads as absent when the session was never written — the caller then replaces", () => {

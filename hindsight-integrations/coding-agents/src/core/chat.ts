@@ -162,7 +162,29 @@ async function settleOps(
       }
     })
   );
-  const lost = statuses.some((s) => LOST_OP_STATUSES.has(s));
+  // A FAILED op still holds its payload server-side, so ask the server to run it again rather than
+  // re-sending (and re-extracting) the whole transcript. Failures here are overwhelmingly transient
+  // — a provider at its usage limit, a wall-clock timeout — and a full replace for each one was the
+  // single biggest source of duplicate work in the queue. Only a retry the server refuses (or a
+  // CANCELLED op, which an operator may have meant) falls back to the replace.
+  const retried = await Promise.all(
+    ops.map(async (id, i) => {
+      if (statuses[i] !== "failed" && statuses[i] !== "error") return false;
+      try {
+        const r = await client.req(
+          "POST",
+          client.bankUrl(`/operations/${encodeURIComponent(id)}/retry`),
+          undefined,
+          [],
+          OP_CHECK_TIMEOUT_MS
+        );
+        return r.ok;
+      } catch {
+        return false;
+      }
+    })
+  );
+  const lost = statuses.some((s, i) => LOST_OP_STATUSES.has(s) && !retried[i]);
   const open = ops.filter((_, i) => !["completed", "not_found"].includes(statuses[i]));
   return { cursor: lost ? { ...cursor, dirty: true } : cursor, ops: lost ? [] : open };
 }
