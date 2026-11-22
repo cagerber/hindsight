@@ -367,12 +367,41 @@ def _stored_body_extends(stored_original_text: str | None, new_body: str | None)
     ):
         return False
 
-    def _turn(item: dict) -> str:
-        return json.dumps(
-            {k: v for k, v in item.items() if k not in _RESTAMPED_TURN_KEYS}, sort_keys=True, ensure_ascii=False
-        )
+    return all(_turn_key(a) == _turn_key(b) for a, b in zip(incoming, stored))
 
-    return all(_turn(a) == _turn(b) for a, b in zip(incoming, stored))
+
+def _turn_key(item: dict) -> str:
+    """A conversation turn's identity, ignoring the keys a harness re-stamps on every send."""
+    return json.dumps(
+        {k: v for k, v in item.items() if k not in _RESTAMPED_TURN_KEYS}, sort_keys=True, ensure_ascii=False
+    )
+
+
+def _queued_body_superseded_by(older_body: str | None, newer_body: str | None) -> bool:
+    """Whether a newer replace body holds everything an older queued replace body does.
+
+    True when the two are the same (a JSON conversation compared turn by turn, ignoring
+    ``_RESTAMPED_TURN_KEYS``) or the newer body strictly extends the older one. Retaining the
+    older body first would then pay to extract text the newer replace writes again anyway.
+    """
+    newer = fact_extraction._sanitize_text(newer_body) if newer_body else ""
+    older = fact_extraction._sanitize_text(older_body) if older_body else ""
+    if not newer or not older:
+        return False
+    if newer == older or _stored_body_extends(newer, older):
+        return True
+    try:
+        a = json.loads(newer, object_pairs_hook=_json_object_without_duplicate_keys)
+        b = json.loads(older, object_pairs_hook=_json_object_without_duplicate_keys)
+    except ValueError:
+        return False
+    return (
+        isinstance(a, list)
+        and isinstance(b, list)
+        and 0 < len(a) == len(b)
+        and all(isinstance(x, dict) for x in a + b)
+        and all(_turn_key(x) == _turn_key(y) for x, y in zip(a, b))
+    )
 
 
 async def _queued_replace_is_superseded(

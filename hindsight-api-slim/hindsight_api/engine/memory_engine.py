@@ -23966,6 +23966,75 @@ class MemoryEngine(MemoryEngineInterface):
                     "document text is not stored and cannot be appended to. Use update_mode='replace' instead."
                 )
 
+    async def _supersede_queued_replaces(
+        self,
+        conn: Any,
+        bank_id: str,
+        document_id: str,
+        new_operation_id: uuid.UUID,
+        item: "Mapping[str, Any]",
+    ) -> list[str]:
+        """Cancel older queued replaces of ``document_id`` that the new replace ``item`` contains.
+
+        A conversation harness re-sends the whole session as a replace on every turn, so a busy
+        queue holds several copies of one document, each a prefix of the next. Only the newest
+        needs extracting: the older ones pay to extract text the newest writes again, and the
+        newest undoes their replaces. A row is cancelled only while it is still 'pending' and
+        unclaimed (``FOR UPDATE SKIP LOCKED``: a row a worker is claiming is left to it, and the
+        orchestrator's stale guard covers that case), carries exactly this one document, and its
+        body is the same as or a strict prefix of the new one (``_queued_body_superseded_by``).
+        Appends are never cancelled. Runs under a savepoint in the caller's transaction, so a
+        failure here leaves the submission itself untouched. Returns the cancelled ids.
+        """
+        if (item.get("update_mode") or "replace") != "replace" or not item.get("content"):
+            return []
+        from .retain.orchestrator import _queued_body_superseded_by
+
+        cancelled: list[str] = []
+        try:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    f"""
+                    SELECT operation_id, task_payload
+                    FROM {fq_table("async_operations")}
+                    WHERE bank_id = $1 AND operation_type = 'retain' AND status = 'pending'
+                      AND serialization_key = $2 AND operation_id <> $3 AND task_payload IS NOT NULL
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    bank_id,
+                    document_id,
+                    new_operation_id,
+                )
+                for row in rows:
+                    payload = conn.parse_json(row["task_payload"]) or {}
+                    old_items = payload.get("contents") or []
+                    if len(old_items) != 1:
+                        continue
+                    old = old_items[0]
+                    if old.get("document_id") != document_id or (old.get("update_mode") or "replace") != "replace":
+                        continue
+                    if not _queued_body_superseded_by(old.get("content"), item.get("content")):
+                        continue
+                    await conn.execute(
+                        f"""
+                        UPDATE {fq_table("async_operations")}
+                        SET status = 'cancelled', updated_at = now(), error_message = $2
+                        WHERE operation_id = $1 AND status = 'pending'
+                        """,
+                        row["operation_id"],
+                        f"superseded by queued replace {new_operation_id}",
+                    )
+                    cancelled.append(str(row["operation_id"]))
+        except Exception as e:  # noqa: BLE001 - an optimization; never fail the submission over it
+            logger.warning(f"Superseding queued replaces of {document_id} failed: {e}")
+            return []
+        if cancelled:
+            logger.info(
+                f"[supersede] {len(cancelled)} queued replace(s) of {document_id} in {bank_id} cancelled: "
+                f"contained in queued replace {new_operation_id}"
+            )
+        return cancelled
+
     async def submit_async_retain(
         self,
         bank_id: str,
@@ -24141,6 +24210,7 @@ class MemoryEngine(MemoryEngineInterface):
         # are effectively no-ops for already-populated task_payload, but we
         # defer them all uniformly for clarity.
         deferred_child_payloads: list[dict[str, Any]] = []
+        superseded_ops: list[str] = []
 
         try:
             async with acquire_with_retry(backend) as conn:
@@ -24227,6 +24297,10 @@ class MemoryEngine(MemoryEngineInterface):
                             child_metadata.document_id,
                         )
                         deferred_child_payloads.append(full_payload)
+                        if len(sub_batch) == 1 and child_metadata.document_id:
+                            superseded_ops += await self._supersede_queued_replaces(
+                                conn, bank_id, child_metadata.document_id, child_operation_id, sub_batch[0]
+                            )
         except Exception as e:
             # Concurrency backstop: a caller-supplied id that lost the parent
             # primary-key race against a simultaneous first submission of the
@@ -24245,6 +24319,16 @@ class MemoryEngine(MemoryEngineInterface):
         # Best-effort default-template hook runs after the bank-create commits.
         if created:
             await self._apply_default_bank_template(bank_id, request_context)
+
+        # Superseded queued replaces were cancelled in the transaction above; roll each one up to
+        # its batch parent the way cancel_operation does. Best-effort: the cancellation stands.
+        for op_id in superseded_ops:
+            try:
+                async with acquire_with_retry(backend) as conn:
+                    async with conn.transaction():
+                        await self._maybe_update_parent_operation(op_id, conn)
+            except Exception as e:
+                logger.warning(f"Failed to roll superseded {op_id} up to its parent: {e}")
 
         logger.info(f"Created parent operation {parent_operation_id} with {len(sub_batches)} child sub-batch(es)")
 
