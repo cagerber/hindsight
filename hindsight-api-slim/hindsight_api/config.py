@@ -975,6 +975,9 @@ ENV_RETAIN_ENTITY_LOOKUP = "HINDSIGHT_API_RETAIN_ENTITY_LOOKUP"
 ENV_RETAIN_ENTITY_RESOLUTION_BATCH_SIZE = "HINDSIGHT_API_RETAIN_ENTITY_RESOLUTION_BATCH_SIZE"
 ENV_RETAIN_ENTITY_RESOLUTION_MAX_CANDIDATES = "HINDSIGHT_API_RETAIN_ENTITY_RESOLUTION_MAX_CANDIDATES"
 ENV_RETAIN_BATCH_ENABLED = "HINDSIGHT_API_RETAIN_BATCH_ENABLED"
+# When false, async retains run in an in-process background task and never write async_operations rows.
+ENV_RETAIN_QUEUE_ENABLED = "HINDSIGHT_API_RETAIN_QUEUE_ENABLED"
+ENV_RETAIN_BACKGROUND_CONCURRENCY = "HINDSIGHT_API_RETAIN_BACKGROUND_CONCURRENCY"
 ENV_RETAIN_BATCH_POLL_INTERVAL_SECONDS = "HINDSIGHT_API_RETAIN_BATCH_POLL_INTERVAL_SECONDS"
 ENV_RETAIN_CHUNK_BATCH_SIZE = "HINDSIGHT_API_RETAIN_CHUNK_BATCH_SIZE"
 ENV_RETAIN_MEMORY_BUDGET_MB = "HINDSIGHT_API_RETAIN_MEMORY_BUDGET_MB"
@@ -2102,6 +2105,8 @@ DEFAULT_RETAIN_ENTITY_RESOLUTION_BATCH_SIZE = 100  # Unique entity names per pg_
 # (pg_trgm / Jaro-Winkler) and keeps only the best N; below the top ~100 the scoring
 # signal is noise, while the cost is a synchronous SequenceMatcher call per candidate.
 DEFAULT_RETAIN_ENTITY_RESOLUTION_MAX_CANDIDATES = 200
+DEFAULT_RETAIN_QUEUE_ENABLED = True
+DEFAULT_RETAIN_BACKGROUND_CONCURRENCY = 2
 DEFAULT_RETAIN_BATCH_ENABLED = False  # Use LLM Batch API for fact extraction (only when async=True)
 DEFAULT_LLM_PROMPT_CACHE_ENABLED = True  # Reuse the fixed system prefix via provider prompt caching
 DEFAULT_LLM_DEBUG_DUMP_4XX = False  # Log the exact request behind any LLM 4xx (diagnostic, off by default)
@@ -4110,6 +4115,8 @@ class HindsightConfig:
     retain_strategies: dict | None
     retain_batch_tokens: int
     retain_batch_enabled: bool
+    retain_queue_enabled: bool
+    retain_background_concurrency: int
     retain_batch_poll_interval_seconds: int
     retain_entity_lookup: str  # "full" or "trigram"
     retain_entity_resolution_batch_size: int  # Unique entity names per pg_trgm candidate lookup query
@@ -5958,6 +5965,11 @@ class HindsightConfig:
                 ENV_RETAIN_ENTITY_RESOLUTION_MAX_CANDIDATES,
                 os.getenv(ENV_RETAIN_ENTITY_RESOLUTION_MAX_CANDIDATES),
                 DEFAULT_RETAIN_ENTITY_RESOLUTION_MAX_CANDIDATES,
+            ),
+            retain_queue_enabled=os.getenv(ENV_RETAIN_QUEUE_ENABLED, str(DEFAULT_RETAIN_QUEUE_ENABLED)).lower()
+            == "true",
+            retain_background_concurrency=max(
+                1, int(os.getenv(ENV_RETAIN_BACKGROUND_CONCURRENCY, str(DEFAULT_RETAIN_BACKGROUND_CONCURRENCY)))
             ),
             retain_batch_enabled=os.getenv(ENV_RETAIN_BATCH_ENABLED, str(DEFAULT_RETAIN_BATCH_ENABLED)).lower()
             == "true",

@@ -9913,7 +9913,8 @@ def _register_routes(app: FastAPI):
                         operation_id=request.operation_id,
                         ingress_attachments=ingress_attachments,
                     )
-                    all_operation_ids.append(result["operation_id"])
+                    if result["operation_id"] is not None:
+                        all_operation_ids.append(result["operation_id"])
                     total_items_count += result["items_count"]
                 return RetainResponse.model_validate(
                     {

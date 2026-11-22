@@ -24179,6 +24179,19 @@ class MemoryEngine(MemoryEngineInterface):
                     f"max={max(sub_batch_sizes)}, total={sum(sub_batch_sizes)})"
                 )
 
+        if not config.retain_queue_enabled:
+            # Queue disabled: no async_operations rows. Make sure the bank exists, then run
+            # the children in-process, in order, bounded by a shared semaphore.
+            created = await self._ensure_bank_exists(bank_id, request_context)
+            if created:
+                await self._apply_default_bank_template(bank_id, request_context)
+            self._spawn_background_retain(bank_id, sub_batches, document_tags, strategy, request_context)
+            logger.info(
+                f"Retain queue disabled: running {len(sub_batches)} sub-batch(es) "
+                f"({len(contents)} items) in the background for bank {bank_id}"
+            )
+            return {"operation_id": None, "items_count": len(contents)}
+
         # Always create parent operation (even for single batch - simpler, more reliable code path).
         # A caller-supplied id becomes the parent id so retries are idempotent.
         parent_operation_id = client_operation_id if client_operation_id is not None else uuid.uuid4()
@@ -24352,6 +24365,54 @@ class MemoryEngine(MemoryEngineInterface):
             "operation_id": str(parent_operation_id),
             "items_count": len(contents),
         }
+
+    def _spawn_background_retain(
+        self,
+        bank_id: str,
+        sub_batches: list[list[Any]],
+        document_tags: list[str] | None,
+        strategy: str | None,
+        request_context: "RequestContext",
+    ) -> None:
+        """Run queue-less async retains as tracked in-process tasks (HINDSIGHT_API_RETAIN_QUEUE_ENABLED=false).
+
+        Appends to one conversation stay ordered through a per-(bank, document) lock; total
+        concurrency is bounded by HINDSIGHT_API_RETAIN_BACKGROUND_CONCURRENCY. A restart loses
+        whatever is in flight, which is the accepted trade-off of not persisting a queue.
+        """
+        if not hasattr(self, "_bg_retain_tasks"):
+            self._bg_retain_tasks: set[asyncio.Task[None]] = set()
+            self._bg_retain_locks: dict[tuple[str, str], asyncio.Lock] = {}
+            self._bg_retain_sem = asyncio.Semaphore(get_config().retain_background_concurrency)
+
+        tenant_id = request_context.tenant_id
+        api_key_id = request_context.api_key_id
+
+        async def _run() -> None:
+            for sub_batch in sub_batches:
+                doc_ids = sorted({str(i["document_id"]) for i in sub_batch if i.get("document_id")})
+                lock = self._bg_retain_locks.setdefault((bank_id, doc_ids[0] if doc_ids else ""), asyncio.Lock())
+                payload: dict[str, Any] = {"bank_id": bank_id, "contents": sub_batch}
+                if document_tags:
+                    payload["document_tags"] = document_tags
+                if strategy:
+                    payload["strategy"] = strategy
+                if tenant_id:
+                    payload["_tenant_id"] = tenant_id
+                if api_key_id:
+                    payload["_api_key_id"] = api_key_id
+                try:
+                    async with lock, self._bg_retain_sem:
+                        await self._handle_batch_retain(payload)
+                except Exception:
+                    logger.exception(f"Background retain failed for bank {bank_id} (not queued, not retried)")
+                finally:
+                    if not lock.locked() and not getattr(lock, "_waiters", None):
+                        self._bg_retain_locks.pop((bank_id, doc_ids[0] if doc_ids else ""), None)
+
+        task = asyncio.create_task(_run())
+        self._bg_retain_tasks.add(task)
+        task.add_done_callback(self._bg_retain_tasks.discard)
 
     async def submit_async_file_retain(
         self,
