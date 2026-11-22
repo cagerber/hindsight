@@ -24182,6 +24182,11 @@ class MemoryEngine(MemoryEngineInterface):
         if not config.retain_queue_enabled:
             # Queue disabled: no async_operations rows. Make sure the bank exists, then run
             # the children in-process, in order, bounded by a shared semaphore.
+            if client_operation_id is not None and self._bg_retain_seen_before(client_operation_id):
+                # A client retry of a submission already accepted in-process: a second run would
+                # append the same turns again. Same contract as the queued replay path.
+                logger.info(f"Queue-less retain replay for operation_id={client_operation_id}: ignored")
+                return {"operation_id": None, "items_count": len(contents)}
             created = await self._ensure_bank_exists(bank_id, request_context)
             if created:
                 await self._apply_default_bank_template(bank_id, request_context)
@@ -24366,6 +24371,25 @@ class MemoryEngine(MemoryEngineInterface):
             "items_count": len(contents),
         }
 
+    _BG_RETAIN_SEEN_TTL_S = 6 * 3600
+    _BG_RETAIN_SEEN_MAX = 20000
+
+    def _bg_retain_seen_before(self, operation_id: uuid.UUID) -> bool:
+        """Record ``operation_id`` as accepted; return True if it was already (within the TTL)."""
+        import time
+        from collections import OrderedDict
+
+        seen: OrderedDict[uuid.UUID, float] = self.__dict__.setdefault("_bg_retain_seen", OrderedDict())
+        now = time.monotonic()
+        while seen and (
+            len(seen) > self._BG_RETAIN_SEEN_MAX or now - next(iter(seen.values())) > self._BG_RETAIN_SEEN_TTL_S
+        ):
+            seen.popitem(last=False)
+        if operation_id in seen:
+            return True
+        seen[operation_id] = now
+        return False
+
     def _spawn_background_retain(
         self,
         bank_id: str,
@@ -24402,10 +24426,23 @@ class MemoryEngine(MemoryEngineInterface):
                 if api_key_id:
                     payload["_api_key_id"] = api_key_id
                 try:
-                    async with lock, self._bg_retain_sem:
-                        await self._handle_batch_retain(payload)
+                    for attempt in range(3):
+                        try:
+                            async with lock, self._bg_retain_sem:
+                                await self._handle_batch_retain(payload)
+                            break
+                        except (ValueError, RetainOperationConflictError):
+                            raise  # can never succeed as sent
+                        except Exception:
+                            if attempt == 2:
+                                raise
+                            logger.warning(
+                                f"Background retain for bank {bank_id} failed (attempt {attempt + 1}/3); retrying",
+                                exc_info=True,
+                            )
+                            await asyncio.sleep(5 * 4**attempt)
                 except Exception:
-                    logger.exception(f"Background retain failed for bank {bank_id} (not queued, not retried)")
+                    logger.exception(f"Background retain failed for bank {bank_id}; dropped (queue is disabled)")
                 finally:
                     if not lock.locked() and not getattr(lock, "_waiters", None):
                         self._bg_retain_locks.pop((bank_id, doc_ids[0] if doc_ids else ""), None)

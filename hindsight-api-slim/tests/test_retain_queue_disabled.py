@@ -63,3 +63,54 @@ async def test_queue_enabled_still_queues(memory, request_context, pool):
         bank_id, [{"content": "queued", "document_id": "doc-q"}], request_context=request_context
     )
     assert result["operation_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_queue_disabled_client_retry_is_not_run_twice(memory, request_context, monkeypatch):
+    import uuid
+
+    monkeypatch.setenv("HINDSIGHT_API_RETAIN_QUEUE_ENABLED", "false")
+    clear_config_cache()
+    calls: list[dict] = []
+
+    async def fake_handle(payload):
+        calls.append(payload)
+
+    monkeypatch.setattr(memory, "_handle_batch_retain", fake_handle)
+    op = str(uuid.uuid4())
+    item = [{"content": "turn 1", "document_id": "doc-r", "update_mode": "append"}]
+    first = await memory.submit_async_retain(
+        "test_retain_idem_bg", item, request_context=request_context, operation_id=op
+    )
+    again = await memory.submit_async_retain(
+        "test_retain_idem_bg", item, request_context=request_context, operation_id=op
+    )
+    await asyncio.gather(*list(memory._bg_retain_tasks))
+    assert first["operation_id"] is None and again["operation_id"] is None
+    assert len(calls) == 1
+    clear_config_cache()
+
+
+@pytest.mark.asyncio
+async def test_queue_disabled_transient_failure_is_retried(memory, request_context, monkeypatch):
+    monkeypatch.setenv("HINDSIGHT_API_RETAIN_QUEUE_ENABLED", "false")
+    clear_config_cache()
+    attempts = 0
+
+    async def flaky(payload):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("transient")
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(memory, "_handle_batch_retain", flaky)
+    monkeypatch.setattr("hindsight_api.engine.memory_engine.asyncio.sleep", no_sleep)
+    await memory.submit_async_retain(
+        "test_retain_retry_bg", [{"content": "x", "document_id": "doc-t"}], request_context=request_context
+    )
+    await asyncio.gather(*list(memory._bg_retain_tasks))
+    assert attempts == 2
+    clear_config_cache()
