@@ -130,6 +130,8 @@ _ATTACHMENT_SWEEP_LOOKBACK = timedelta(days=7)
 # Fork E3: per-pass bounds of the span-index backfill and dangling-reference repair.
 _SPAN_BACKFILL_LIMIT = 2000
 _SPAN_RECONCILE_LIMIT = 500
+# Expired extraction-cache entries deleted per schema per run (fork E4).
+_EXTRACTION_CACHE_PRUNE_LIMIT = 5000
 
 
 @dataclass(frozen=True)
@@ -227,7 +229,17 @@ class MaintenanceLoop:
         op_cleanup_on = cfg.operation_cleanup_interval_seconds > 0 and cfg.operation_retention_days > 0
         attachment_sweep_on = cfg.attachment_sweep_interval_seconds > 0
         span_on = getattr(cfg, "retain_span_reconcile_interval_seconds", 0) > 0
-        return reconcile_on or audit_on or llm_on or mm_refresh_on or op_cleanup_on or attachment_sweep_on or span_on
+        cache_prune_on = sweep_on and getattr(cfg, "retain_extraction_cache_ttl_seconds", 0) > 0
+        return (
+            reconcile_on
+            or audit_on
+            or llm_on
+            or mm_refresh_on
+            or op_cleanup_on
+            or attachment_sweep_on
+            or span_on
+            or cache_prune_on
+        )
 
     # ── loop ───────────────────────────────────────────────────────────────
 
@@ -297,6 +309,9 @@ class MaintenanceLoop:
         span_interval = getattr(cfg, "retain_span_reconcile_interval_seconds", 0)
         if span_interval > 0 and self._is_due("span_reconcile", span_interval):
             await self._run_timed("span reconcile", self._run_span_reconcile(cfg))
+        cache_ttl = getattr(cfg, "retain_extraction_cache_ttl_seconds", 0)
+        if retention_interval > 0 and cache_ttl > 0 and self._is_due("extraction_cache_prune", retention_interval):
+            await self._run_timed("extraction cache prune", self._run_extraction_cache_prune(cache_ttl))
 
     async def _run_timed(self, name: str, coro: Coroutine[Any, Any, None]) -> None:
         """Run a maintenance job and emit one timing line for it.
@@ -594,6 +609,43 @@ class MaintenanceLoop:
                 _current_schema.reset(token)
         if any(totals.values()):
             logger.info("Span reconcile: " + ", ".join(f"{k}={v}" for k, v in totals.items()))
+
+    # ── extraction cache prune (fork E4) ─────────────────────────────────────
+
+    async def _run_extraction_cache_prune(self, ttl_seconds: int) -> None:
+        """Delete extraction-cache entries older than the TTL, a bounded batch per served schema.
+
+        Runs on the retention-sweep cadence whether or not the cache is switched on, so entries
+        left behind after switching it off still expire.
+        """
+        if _is_oracle():
+            return
+        from .memories import get_memories
+
+        engine = self._engine
+        store = get_memories()
+        try:
+            tenants = await engine._tenant_extension.list_tenants()
+        except Exception as e:
+            logger.warning(f"Extraction cache prune tenant discovery failed: {e}")
+            return
+        schemas = {get_config().database_schema} | {t.schema for t in tenants}
+        pruned = 0
+        for schema in sorted(schemas):
+            if self._stop.is_set():
+                break
+            token = _current_schema.set(schema)
+            try:
+                async with acquire_with_retry(engine._backend, max_retries=1) as conn:
+                    pruned += await store.extraction_cache_prune(
+                        conn=conn, older_than_seconds=ttl_seconds, limit=_EXTRACTION_CACHE_PRUNE_LIMIT
+                    )
+            except Exception as e:
+                logger.warning(f"Extraction cache prune failed in {schema}: {e}")
+            finally:
+                _current_schema.reset(token)
+        if pruned:
+            logger.info(f"Extraction cache prune: deleted {pruned} expired entr{'y' if pruned == 1 else 'ies'}")
 
     async def _restore_span_chunk(
         self, bank_id: str, document_id: str, chunk_id: str, context: RequestContext, chunk_storage: Any

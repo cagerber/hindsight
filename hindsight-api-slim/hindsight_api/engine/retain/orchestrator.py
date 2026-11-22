@@ -2304,10 +2304,18 @@ async def retain_batch(
     # delta ran with no concurrency control at all.
     # Fork E3: the bank-wide source-span filter for this document (None when off), seen by the
     # extraction calls and the chunk-storing transactions below through a context variable.
+    # Fork E4: the extraction checkpoint cache (None when off), seen the same way by the
+    # per-chunk extraction calls.
+    from . import extraction_cache as _extraction_cache_mod
     from . import span_filter as _span_filter_mod
 
-    with _span_filter_mod.activated(
-        _span_filter_mod.for_retain(pool, bank_id, effective_doc_id, config, force_reextract=force_reextract)
+    with (
+        _span_filter_mod.activated(
+            _span_filter_mod.for_retain(pool, bank_id, effective_doc_id, config, force_reextract=force_reextract)
+        ),
+        _extraction_cache_mod.activated(
+            _extraction_cache_mod.for_retain(pool, bank_id, force_reextract=force_reextract)
+        ),
     ):
         from ..memories import get_memories as _get_memories_delta
 

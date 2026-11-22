@@ -171,6 +171,22 @@ async def _seed_bank(conn: asyncpg.Connection, bank_id: str) -> list[uuid.UUID]:
     )
     await conn.execute("INSERT INTO graph_maintenance_queue (bank_id, unit_id) VALUES ($1, $2)", bank_id, unit_a)
     await conn.execute("INSERT INTO entity_maintenance_queue (bank_id, entity_id) VALUES ($1, $2)", bank_id, entity_a)
+    # Fork E3 (source-span index) and E4 (extraction checkpoint cache).
+    await conn.execute(
+        "INSERT INTO chunk_span_index (chunk_id, bank_id, chunk_hash) VALUES ($1, $2, 'h')", chunk_id, bank_id
+    )
+    await conn.execute(
+        "INSERT INTO chunk_paragraphs (chunk_id, para_hash, bank_id) VALUES ($1, $2, $3)", chunk_id, b"p" * 16, bank_id
+    )
+    await conn.execute(
+        "INSERT INTO span_refs (referring_chunk_id, para_hash, bank_id, source_chunk_id) VALUES ($1, $2, $3, $1)",
+        chunk_id,
+        b"p" * 16,
+        bank_id,
+    )
+    await conn.execute(
+        "INSERT INTO extraction_cache (bank_id, request_hash, facts) VALUES ($1, $2, '[]'::jsonb)", bank_id, b"r" * 16
+    )
     # Knowledge-bank rows hang off `banks` too (a bank of kind 'knowledge' in real use); seeded
     # here so the cascade from the bank row is checked for them as well. The embedding columns
     # are sized on first use, so a vector of whatever width they hold now.

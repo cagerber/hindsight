@@ -63,6 +63,7 @@ from .pg import banks as pg_banks
 from .pg import consolidation as pg_consolidation
 from .pg import counts, curation, documents, engine_curation, graph, reads, writes
 from .pg import expand as pg_expand
+from .pg import extraction_cache as pg_extraction_cache
 from .pg import links as pg_links
 from .pg import retain as pg_retain
 from .pg import span_index as pg_span_index
@@ -1389,6 +1390,44 @@ class PostgresMemories(MemoriesExtension):
             backfill_limit=backfill_limit,
             reconcile_limit=reconcile_limit,
             grace_seconds=grace_seconds,
+        )
+
+    # Extraction checkpoint cache (fork E4), see pg/extraction_cache.py. Oracle has no such table.
+    def extraction_cache_for(self, bank_id: str) -> bool:
+        from ..schema import _is_oracle
+
+        return not _is_oracle()
+
+    async def extraction_cache_get(self, *, conn, bank_id: str, request_hash: bytes) -> dict[str, Any] | None:
+        return await pg_extraction_cache.get(
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, request_hash=request_hash
+        )
+
+    async def extraction_cache_put(
+        self,
+        *,
+        conn,
+        bank_id: str,
+        request_hash: bytes,
+        facts: list[dict[str, Any]],
+        model: str | None,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        await pg_extraction_cache.put(
+            conn=conn,
+            fq_table=fq_store_table,
+            bank_id=bank_id,
+            request_hash=request_hash,
+            facts=facts,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    async def extraction_cache_prune(self, *, conn, older_than_seconds: int, limit: int) -> int:
+        return await pg_extraction_cache.prune(
+            conn=conn, fq_table=fq_store_table, older_than_seconds=older_than_seconds, limit=limit
         )
 
     # Not on the interface: the bank list and a new bank's vector indexes are about Postgres's own

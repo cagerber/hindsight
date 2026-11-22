@@ -3967,6 +3967,39 @@ class MemoriesExtension(Extension, ABC):
         None here (no index to maintain)."""
         return None
 
+    # ------------------------------------------------------------------ extraction cache (fork E4)
+    #
+    # Retain saves each chunk's parsed extraction the moment the LLM returns, keyed by a hash of
+    # the exact request, so a retry or an unchanged re-send reuses the paid call. Only a store with
+    # SQL rows keeps one; every default here is "no cache", which leaves the cache off for the bank.
+
+    def extraction_cache_for(self, bank_id: str) -> bool:
+        """Whether this store keeps the extraction cache for ``bank_id``. False here."""
+        return False
+
+    async def extraction_cache_get(self, *, conn, bank_id: str, request_hash: bytes) -> dict[str, Any] | None:
+        """The cached extraction for ``request_hash`` (``facts``, ``model``, ``input_tokens``,
+        ``output_tokens``), or None. Always None here."""
+        return None
+
+    async def extraction_cache_put(
+        self,
+        *,
+        conn,
+        bank_id: str,
+        request_hash: bytes,
+        facts: list[dict[str, Any]],
+        model: str | None,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Save one chunk's extraction. A no-op here."""
+        return None
+
+    async def extraction_cache_prune(self, *, conn, older_than_seconds: int, limit: int) -> int:
+        """Delete expired entries in the current schema; returns how many. 0 here."""
+        return 0
+
     # ------------------------------------------------------------------ retain links and entity resolution
     #
     # The retain-time link writes, the ANN neighbour search behind them, and entity resolution.

@@ -1317,6 +1317,8 @@ ENV_RETAIN_SPAN_FILTER = "HINDSIGHT_API_RETAIN_SPAN_FILTER"
 ENV_RETAIN_SPAN_FILTER_MIN_CHARS = "HINDSIGHT_API_RETAIN_SPAN_FILTER_MIN_CHARS"
 ENV_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS = "HINDSIGHT_API_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS"
 ENV_RETAIN_SPAN_ORPHAN_GRACE_SECONDS = "HINDSIGHT_API_RETAIN_SPAN_ORPHAN_GRACE_SECONDS"
+ENV_RETAIN_EXTRACTION_CACHE = "HINDSIGHT_API_RETAIN_EXTRACTION_CACHE"
+ENV_RETAIN_EXTRACTION_CACHE_TTL_SECONDS = "HINDSIGHT_API_RETAIN_EXTRACTION_CACHE_TTL_SECONDS"
 ENV_OPERATION_CLEANUP_INTERVAL_SECONDS = "HINDSIGHT_API_OPERATION_CLEANUP_INTERVAL_SECONDS"
 ENV_ATTACHMENT_SWEEP_INTERVAL_SECONDS = "HINDSIGHT_API_ATTACHMENT_SWEEP_INTERVAL_SECONDS"
 ENV_MAINTENANCE_START_JITTER_SECONDS = "HINDSIGHT_API_MAINTENANCE_START_JITTER_SECONDS"
@@ -2518,6 +2520,13 @@ DEFAULT_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS = 300
 # A reference must stay unresolvable this long before its chunk is re-extracted, so a replace
 # that deletes a source and re-writes the paragraph in a later sub-batch is not paid twice.
 DEFAULT_RETAIN_SPAN_ORPHAN_GRACE_SECONDS = 900
+# Extraction checkpoint cache (fork E4). Off by default: each chunk's parsed extraction is saved,
+# keyed by a hash of the exact prompt and model, the moment the LLM returns, so a retry, a
+# timed-out run or an unchanged re-send reuses the paid call instead of making it again.
+DEFAULT_RETAIN_EXTRACTION_CACHE = False
+# Entries older than this are pruned by the maintenance loop (which runs the prune on the
+# retention-sweep cadence). Long enough to cover retries and a re-send after an outage.
+DEFAULT_RETAIN_EXTRACTION_CACHE_TTL_SECONDS = 3 * 24 * 3600
 
 # How often terminal async_operations rows past their retention are pruned. One
 # bounded batch per tenant schema per run, so this also sets the drain rate for a
@@ -4401,6 +4410,8 @@ class HindsightConfig:
     retain_span_filter_min_chars: int = DEFAULT_RETAIN_SPAN_FILTER_MIN_CHARS
     retain_span_reconcile_interval_seconds: int = DEFAULT_RETAIN_SPAN_RECONCILE_INTERVAL_SECONDS
     retain_span_orphan_grace_seconds: int = DEFAULT_RETAIN_SPAN_ORPHAN_GRACE_SECONDS
+    retain_extraction_cache: bool = DEFAULT_RETAIN_EXTRACTION_CACHE
+    retain_extraction_cache_ttl_seconds: int = DEFAULT_RETAIN_EXTRACTION_CACHE_TTL_SECONDS
 
     # Retry/backoff applied to remote embedding API calls (see engine/remote_retry.py's RetryPolicy).
     embeddings_max_retries: int = DEFAULT_EMBEDDINGS_MAX_RETRIES
@@ -6413,6 +6424,15 @@ class HindsightConfig:
                 ENV_RETAIN_SPAN_ORPHAN_GRACE_SECONDS,
                 os.getenv(ENV_RETAIN_SPAN_ORPHAN_GRACE_SECONDS),
                 DEFAULT_RETAIN_SPAN_ORPHAN_GRACE_SECONDS,
+            ),
+            retain_extraction_cache=os.getenv(ENV_RETAIN_EXTRACTION_CACHE, str(DEFAULT_RETAIN_EXTRACTION_CACHE))
+            .strip()
+            .lower()
+            in ("true", "1", "yes"),
+            retain_extraction_cache_ttl_seconds=_parse_non_negative_int(
+                ENV_RETAIN_EXTRACTION_CACHE_TTL_SECONDS,
+                os.getenv(ENV_RETAIN_EXTRACTION_CACHE_TTL_SECONDS),
+                DEFAULT_RETAIN_EXTRACTION_CACHE_TTL_SECONDS,
             ),
             vector_index_min_rows=_parse_non_negative_int(
                 ENV_VECTOR_INDEX_MIN_ROWS,

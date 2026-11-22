@@ -2092,6 +2092,96 @@ async def _extract_facts_from_chunk(
     vlm_config: "AnyLLMProvider | None" = None,
     extraction_prompt: ExtractionPrompt | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
+    """Extract facts from a single chunk, through the fork's extraction checkpoint cache (E4).
+
+    With no cache active (see ``extraction_cache.py``) this is exactly
+    :func:`_extract_facts_from_chunk_uncached`. With one, the request is hashed first: a hit
+    returns the saved facts with zero usage and makes no LLM call; a miss makes the call and
+    saves its facts before returning, so a run that dies afterwards leaves the work behind.
+    """
+
+    async def _uncached() -> Any:
+        return await _extract_facts_from_chunk_uncached(
+            chunk=chunk,
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+            event_date=event_date,
+            context=context,
+            llm_config=llm_config,
+            config=config,
+            agent_name=agent_name,
+            metadata=metadata,
+            attachment_loader=attachment_loader,
+            vlm_config=vlm_config,
+            extraction_prompt=extraction_prompt,
+        )
+
+    from . import extraction_cache as _xcache
+
+    cache = _xcache.current()
+    # Inline images are resolved to bytes the key does not cover: never cache such a chunk.
+    if cache is None or (
+        attachment_loader is not None and next(attachment_content.iter_placeholder_ids(chunk or ""), None) is not None
+    ):
+        return await _uncached()
+
+    parts = build_chunk_prompt_parts(
+        config,
+        chunk=chunk,
+        chunk_index=chunk_index,
+        total_chunks=total_chunks,
+        event_date=event_date,
+        context=context,
+        metadata=metadata,
+        agent_name=agent_name,
+        extraction_prompt=extraction_prompt,
+    )
+    provider = getattr(llm_config, "provider", None)
+    model = getattr(llm_config, "model", None)
+    key = _xcache.request_hash(
+        provider=str(provider) if provider is not None else None,
+        model=str(model) if model is not None else None,
+        system_prompt=parts.system_prompt,
+        user_message=parts.user_message,
+        response_schema=parts.response_schema,
+        extraction_mode=config.retain_extraction_mode,
+        temperature=getattr(config, "llm_temperature_retain", None),
+    )
+    entry = await cache.get(key)
+    if entry is not None:
+        try:
+            cached = [Fact.model_validate(f) for f in entry["facts"]]
+        except Exception as e:  # noqa: BLE001 - a stale or corrupt entry is just a miss
+            logger.warning(f"[extraction-cache] unreadable entry for chunk {chunk_index + 1}/{total_chunks}: {e}")
+        else:
+            logger.debug(f"[extraction-cache] hit for chunk {chunk_index + 1}/{total_chunks}: {len(cached)} facts")
+            return cached, TokenUsage()
+
+    facts, usage = await _uncached()
+    await cache.put(
+        key,
+        facts=[f.model_dump(mode="json") if hasattr(f, "model_dump") else f for f in facts],
+        model=str(model) if model is not None else None,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+    )
+    return facts, usage
+
+
+async def _extract_facts_from_chunk_uncached(
+    chunk: str,
+    chunk_index: int,
+    total_chunks: int,
+    event_date: datetime | None,
+    context: str,
+    llm_config: "AnyLLMProvider",
+    config,
+    agent_name: str | None = None,
+    metadata: dict[str, str] | None = None,
+    attachment_loader: "AttachmentLoader | None" = None,
+    vlm_config: "AnyLLMProvider | None" = None,
+    extraction_prompt: ExtractionPrompt | None = None,
+) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a single chunk (internal helper for parallel processing).
 

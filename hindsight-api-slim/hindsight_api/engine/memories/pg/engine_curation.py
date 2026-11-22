@@ -168,6 +168,8 @@ async def purge_bank_rows(*, conn, fq_table: Callable[[str], str], bank_id: str)
     # would otherwise outlive the bank.
     await conn.execute(f"DELETE FROM {fq_table('graph_maintenance_queue')} WHERE bank_id = $1", bank_id)
     await conn.execute(f"DELETE FROM {fq_table('entity_maintenance_queue')} WHERE bank_id = $1", bank_id)
+    # Fork E4: saved chunk extractions carry the bank's facts; they go with the bank.
+    await conn.execute(f"DELETE FROM {fq_table('extraction_cache')} WHERE bank_id = $1", bank_id)
     return legacy_files
 
 

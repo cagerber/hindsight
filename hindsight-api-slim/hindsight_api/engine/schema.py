@@ -27,6 +27,8 @@ STORE_TABLES = frozenset(
         "chunk_paragraphs",
         "chunk_span_index",
         "span_refs",
+        # Fork E4: the Postgres store's extraction checkpoint cache.
+        "extraction_cache",
     }
 )
 
