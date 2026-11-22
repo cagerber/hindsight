@@ -470,6 +470,45 @@ describe("buildRetain", () => {
     expect(parsed.at(-1)).toMatchObject({ role: "assistant", content: "done" });
   });
 
+  it("appends after a Stop that recovered the unflushed final reply", async () => {
+    // Regression: the recovered reply carries the hook's clock as its timestamp, the flushed one the
+    // host's. With timestamps in the fingerprint the next Stop saw a rewritten prefix and replaced
+    // the whole conversation on every turn (59 of one session's 60 write-backs were replaces).
+    const cursors = memoryCursorStore();
+    const retain = vi.fn().mockResolvedValue(undefined);
+    const client = { retain, bank: "test-bank", supportsAppendRetain: async () => true };
+    const ask = { role: "user", content: "make the change", timestamp: "2026-11-22T00:22:00.000Z" };
+    writeFileSync(file, "");
+    await buildRetain({
+      harness: "claude-code",
+      sessionId: "sess-lag",
+      transcriptPath: file,
+      cursors,
+      client: client as unknown as HindsightClient,
+      readTranscript: () => [ask],
+      lastAssistantMessage: "done",
+    });
+    expect(retain.mock.calls[0][5].updateMode).toBeUndefined();
+
+    await buildRetain({
+      harness: "claude-code",
+      sessionId: "sess-lag",
+      transcriptPath: file,
+      cursors,
+      client: client as unknown as HindsightClient,
+      readTranscript: () => [
+        ask,
+        { role: "assistant", content: "done", timestamp: "2026-11-22T00:22:40.994Z" },
+        { role: "user", content: "now the tests", timestamp: "2026-11-22T00:23:56.047Z" },
+      ],
+    });
+    expect(retain).toHaveBeenCalledTimes(2);
+    expect(retain.mock.calls[1][5].updateMode).toBe("append");
+    expect(retain.mock.calls[1][0].split("\n").map((l: string) => JSON.parse(l))).toEqual([
+      { role: "user", content: "now the tests", timestamp: "2026-11-22T00:23:56.047Z" },
+    ]);
+  });
+
   it("does not duplicate the final reply when Dcode's transcript already flushed it", async () => {
     // The branch the lag recovery has to not break: on runs where the store flushed in time the
     // reply is in BOTH the transcript and the Stop event, and must be retained exactly once.
