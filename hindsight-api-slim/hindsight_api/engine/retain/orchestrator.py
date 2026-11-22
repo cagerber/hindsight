@@ -332,6 +332,86 @@ def assert_append_extends_stored_body(
     )
 
 
+# Keys a conversation harness re-stamps on every submission without the turn changing: the hook
+# that sends a session puts the clock time of the send on its last turn. Two copies of the same
+# turns therefore differ in these and nothing else, so the prefix check below ignores them.
+_RESTAMPED_TURN_KEYS = frozenset({"timestamp"})
+
+
+def _stored_body_extends(stored_original_text: str | None, new_body: str | None) -> bool:
+    """Whether the stored document holds ``new_body`` followed by more content.
+
+    The reverse of ``assert_append_extends_stored_body``: true when ``new_body`` is an EARLIER
+    version of what is stored. Plain text must be a strict byte prefix. A JSON conversation array
+    must be a strict prefix item for item, ignoring ``_RESTAMPED_TURN_KEYS``. Anything else,
+    including an equal body, is not a prefix, so the caller's normal path handles it.
+    """
+    if not stored_original_text or not new_body:
+        return False
+    sanitized = fact_extraction._sanitize_text(new_body) or ""
+    if not sanitized:
+        return False
+    if len(stored_original_text) > len(sanitized) and stored_original_text.startswith(sanitized):
+        return True
+    try:
+        stored = json.loads(stored_original_text, object_pairs_hook=_json_object_without_duplicate_keys)
+        incoming = json.loads(sanitized, object_pairs_hook=_json_object_without_duplicate_keys)
+    except ValueError:  # JSONDecodeError, and the duplicate-key rejection
+        return False
+    if not (
+        isinstance(stored, list)
+        and isinstance(incoming, list)
+        and 0 < len(incoming) < len(stored)
+        and all(isinstance(item, dict) for item in stored)
+        and all(isinstance(item, dict) for item in incoming)
+    ):
+        return False
+
+    def _turn(item: dict) -> str:
+        return json.dumps(
+            {k: v for k, v in item.items() if k not in _RESTAMPED_TURN_KEYS}, sort_keys=True, ensure_ascii=False
+        )
+
+    return all(_turn(a) == _turn(b) for a, b in zip(incoming, stored))
+
+
+async def _queued_replace_is_superseded(
+    pool: Any,
+    *,
+    bank_id: str,
+    document_id: str,
+    operation_id: str,
+    doc_updated_at: datetime,
+    incoming_body: str,
+) -> bool:
+    """Whether a queued replace is an older copy of a document that has since moved on.
+
+    True only when the document was written after the operation was queued AND the stored body
+    strictly extends ``incoming_body``. Best-effort: any read failure answers False, so the
+    retain proceeds as it did before this check existed.
+    """
+    try:
+        async with acquire_with_retry(pool) as conn:
+            queued_at = await conn.fetchval(
+                f"SELECT created_at FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                uuid.UUID(operation_id),
+            )
+            if queued_at is None or doc_updated_at <= queued_at:
+                return False
+            # Through the memories extension: the documents table can live in a store schema
+            # that `fq_table` alone does not name.
+            from ..memories import get_memories
+
+            base = await get_memories().read_document_base(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
+            )
+            stored_text = base.original_text if base else None
+    except Exception:  # noqa: BLE001 - an optimization; never fail the retain over it
+        logger.debug("superseded-replace check failed for %s", document_id, exc_info=True)
+        return False
+    return _stored_body_extends(stored_text, incoming_body)
+
+
 def _is_strict_append_of_stored_document(
     stored_original_text: str | None,
     full_document_body: str | None,
@@ -2119,6 +2199,42 @@ async def retain_batch(
             # No new content was processed — report 0 so callers can skip
             # billing cleanly instead of falling back to full-content billing.
             return _align_result(RetainBatchResult([[] for _ in contents], TokenUsage(), 0))
+
+    # --- Superseded queued replace ---
+    # The stale check above only sees writes that landed while THIS request was running. A replace
+    # that sat in the queue while a newer copy of the same document was retained gets past it, and
+    # would roll the document back to the older copy: the newer turns' chunks are deleted, their
+    # facts cascade away, and the next submission pays to extract them again. Refuse it when the
+    # stored body already holds this one and more, and was written after this operation was queued.
+    # The second condition keeps a deliberate truncation working: one submitted after the last write
+    # is newer than it, so it goes through.
+    if (
+        not is_append
+        and update_mode in (None, "replace")
+        and is_first_batch
+        and not force_reextract
+        and operation_id
+        and doc_updated_at is not None
+    ):
+        incoming_body = full_document_body
+        if incoming_body is None and len(contents_dicts) == 1:
+            incoming_body = contents_dicts[0].get("content")
+        if incoming_body:
+            superseded = await _queued_replace_is_superseded(
+                pool,
+                bank_id=bank_id,
+                document_id=effective_doc_id,
+                operation_id=operation_id,
+                doc_updated_at=doc_updated_at,
+                incoming_body=incoming_body,
+            )
+            if superseded:
+                log_buffer.append(
+                    f"[superseded] Skipping retain: document {effective_doc_id} was written after this "
+                    f"replace was queued and already contains its body"
+                )
+                logger.info("\n" + "\n".join(log_buffer) + "\n")
+                return _align_result(RetainBatchResult([[] for _ in contents], TokenUsage(), 0))
 
     # --- Delta retain: check if we can skip unchanged chunks ---
     #
