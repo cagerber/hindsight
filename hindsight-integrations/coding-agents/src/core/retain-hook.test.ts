@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -840,7 +841,9 @@ describe("runRetainHook honors retainSessions", () => {
 
   const stubClient = () => {
     const retain = vi.fn().mockResolvedValue(undefined);
-    const makeClient = vi.fn(() => ({
+    // Carries the bank it was built for, as the real client does: the retain cursor records it.
+    const makeClient = vi.fn((opts: { bank: string }) => ({
+      bank: opts.bank,
       retain,
       supportsAppendRetain: async () => false,
     })) as unknown as Parameters<typeof runRetainHook>[1];
@@ -868,6 +871,75 @@ describe("runRetainHook honors retainSessions", () => {
     stdin = JSON.stringify({ ...event(), notification_type: "idle_prompt" });
     await runRetainHook(notificationSpec, makeClient);
     expect(retain).toHaveBeenCalledTimes(1);
+  });
+
+  // A session started in a non-project folder (`~`) that works in a repository and then visits a
+  // non-project folder (`~`, `/tmp`) stays in the repository's bank. Following the folder used to
+  // flip it back to the starting folder's fallback bank and into the repo again, re-sending the
+  // whole conversation to each bank on every flip.
+  it("keeps a session's bank while it visits a directory that names no project", async () => {
+    const { retain, makeClient } = stubClient();
+    const bankOf = (i: number) =>
+      (makeClient as unknown as ReturnType<typeof vi.fn>).mock.calls[i][0].bank;
+    const addTurn = (n: number) =>
+      writeFileSync(
+        file,
+        readFileSync(file, "utf8") +
+          "\n" +
+          JSON.stringify({
+            type: "user",
+            timestamp: `2026-01-01T00:0${n}:00Z`,
+            message: { role: "user", content: `turn ${n}` },
+          })
+      );
+    await runRetainHook(spec, makeClient); // starts in `root`, which is no repository
+
+    const repo = mkdtempSync(join(tmpdir(), "hs-repo-"));
+    const elsewhere = mkdtempSync(join(tmpdir(), "hs-visit-"));
+    try {
+      execFileSync("git", ["init", "-q", repo]);
+      addTurn(1);
+      stdin = JSON.stringify({ ...event(), cwd: repo });
+      await runRetainHook(spec, makeClient);
+      const repoBank = bankOf(1);
+      expect(repoBank).not.toBe(bankOf(0));
+
+      addTurn(2);
+      stdin = JSON.stringify({ ...event(), cwd: elsewhere });
+      await runRetainHook(spec, makeClient);
+      expect(retain).toHaveBeenCalledTimes(3);
+      expect(bankOf(2)).toBe(repoBank);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it("still moves the session when it enters a mapped directory", async () => {
+    const { retain, makeClient } = stubClient();
+    await runRetainHook(spec, makeClient);
+
+    const mapped = mkdtempSync(join(tmpdir(), "hs-mapped-"));
+    try {
+      rawConfig = { mapPathToBank: { [mapped]: "mapped-bank" } };
+      writeFileSync(
+        file,
+        readFileSync(file, "utf8") +
+          "\n" +
+          JSON.stringify({
+            type: "user",
+            timestamp: "2026-01-01T00:01:00Z",
+            message: { role: "user", content: "and vitest for tests" },
+          })
+      );
+      stdin = JSON.stringify({ ...event(), cwd: mapped });
+      await runRetainHook(spec, makeClient);
+      const calls = (makeClient as unknown as ReturnType<typeof vi.fn>).mock.calls;
+      expect(retain).toHaveBeenCalledTimes(2);
+      expect(calls.at(-1)?.[0].bank).toBe("mapped-bank");
+    } finally {
+      rmSync(mapped, { recursive: true, force: true });
+    }
   });
 
   it("retainSessions: false -> no write-back, and no client is even built", async () => {
