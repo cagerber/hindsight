@@ -1598,7 +1598,11 @@ class OracleOps(DataAccessOps):
         *,
         bank_cursor="",
         consolidation_bank_priority=None,
+        live_window_hours=0,
+        backfill_excluded_banks=(),
     ):
+        # live_window_hours / backfill_excluded_banks are not implemented on Oracle: claiming
+        # stays oldest-first there, which is the documented fallback.
         all_rows = []
         claimed_ids = []
 

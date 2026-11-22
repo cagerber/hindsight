@@ -449,6 +449,8 @@ class WorkerPoller:
             consolidation_bank_priority if consolidation_bank_priority else None
         )
         self._max_retries = max(0, max_retries)  # Never negative
+        # schema -> (monotonic time read, banks whose hourly backfill budget is spent)
+        self._backfill_budget_cache: dict[str | None, tuple[float, tuple[str, ...]]] = {}
         # Cache of which optional PG routines are installed on the server
         # (probed once, memoised for the life of the poller).
         from ..engine.db.optional_routines import OptionalRoutines
@@ -772,6 +774,38 @@ class WorkerPoller:
             logger.warning(f"Worker {self._worker_id} failed to claim tasks for schema {schema_display}: {e}")
             return []
 
+    _BACKFILL_BUDGET_REFRESH_SECONDS = 60.0
+
+    async def _backfill_excluded_banks(
+        self, conn: "DatabaseConnection", schema: str | None, table: str, live_window_hours: int
+    ) -> tuple[str, ...]:
+        """Banks whose hourly backfill budget is spent: skip their pre-window retains this round.
+
+        Backfill is a retain queued before the live window (all retains when the window is 0).
+        A bank's spend is the payload characters of the backfill retains claimed in the past
+        hour. Worked out at most once a minute per schema, not on every poll: the claim then
+        costs only an array test. Best-effort: a failed read leaves nothing excluded.
+        """
+        budget = get_config().worker_backfill_chars_per_bank_hour
+        if budget <= 0:
+            return ()
+        cache = self._backfill_budget_cache
+        now = time.monotonic()
+        hit = cache.get(schema)
+        if hit is not None and now - hit[0] < self._BACKFILL_BUDGET_REFRESH_SECONDS:
+            return hit[1]
+        try:
+            banks = tuple(
+                sorted(await self._backend.ops.backfill_budget_spent_banks(conn, table, budget, live_window_hours))
+            )
+        except Exception as e:  # noqa: BLE001 - a budget is a throttle, never a reason to stop claiming
+            logger.warning(f"Backfill budget read failed for schema {schema}: {e}")
+            banks = ()
+        if banks and banks != (hit[1] if hit else ()):
+            logger.info(f"[backfill-budget] {len(banks)} bank(s) over {budget:,} chars/hour: {', '.join(banks)}")
+        cache[schema] = (now, banks)
+        return banks
+
     async def _claim_batch_for_schema_inner(
         self,
         conn: "DatabaseConnection",
@@ -790,6 +824,9 @@ class WorkerPoller:
         """
         table = fq_table("async_operations", schema)
 
+        live_window_hours = get_config().worker_live_window_hours
+        excluded = await self._backfill_excluded_banks(conn, schema, table, live_window_hours)
+
         async with conn.transaction():
             claimed = await self._backend.ops.claim_tasks(
                 conn,
@@ -799,6 +836,8 @@ class WorkerPoller:
                 shared_limit,
                 bank_cursor=self._next_bank_cursor.get(schema, ""),
                 consolidation_bank_priority=self._consolidation_bank_priority,
+                live_window_hours=live_window_hours,
+                backfill_excluded_banks=excluded,
             )
             # Where the rotation got to. Carried across claims per schema, the
             # way _next_schema_idx is across tenants; the claim query itself

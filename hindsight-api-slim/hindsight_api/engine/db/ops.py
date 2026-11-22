@@ -17,6 +17,7 @@ and mirrors Django's ``DatabaseOperations`` architecture.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -997,6 +998,16 @@ class DataAccessOps(ABC):
         """
         ...
 
+    async def backfill_budget_spent_banks(
+        self, conn: DatabaseConnection, table: str, budget_chars: int, live_window_hours: int
+    ) -> Sequence[str]:
+        """Banks that claimed at least ``budget_chars`` of backfill retain payload in the past hour.
+
+        Backfill is a retain queued more than ``live_window_hours`` before it was claimed (every
+        retain when the window is 0). The default answers none, which leaves claiming unthrottled.
+        """
+        return ()
+
     @abstractmethod
     async def claim_tasks(
         self,
@@ -1008,8 +1019,16 @@ class DataAccessOps(ABC):
         *,
         bank_cursor: str = "",
         consolidation_bank_priority: dict[str, int] | None = None,
+        live_window_hours: int = 0,
+        backfill_excluded_banks: Sequence[str] = (),
     ) -> ClaimedOperations:
         """Claim pending tasks from the async_operations table.
+
+        ``live_window_hours`` > 0 asks the shared pool to take operations queued within that
+        many hours before older ones (live work ahead of a backfill), and
+        ``backfill_excluded_banks`` names banks whose retains queued before that window are
+        not claimed this round (their hourly backfill budget is spent). Both are optional
+        refinements: a backend that ignores them claims as before.
 
         Implementations must apply :func:`bank_serialization_sql` to every query
         that can return a ``graph_maintenance`` or ``consolidation`` row, so at

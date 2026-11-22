@@ -1850,7 +1850,9 @@ class PostgreSQLOps(DataAccessOps):
             *params,
         )
 
-    async def _claim_reserved_tasks(self, conn, table, limit, op_type) -> list:
+    async def _claim_reserved_tasks(
+        self, conn, table, limit, op_type, live_window_hours: int = 0, backfill_excluded_banks=()
+    ) -> list:
         """Claim rows of one operation type against that type's reserved pool.
 
         No bank rotation here: reservations are a floor for an operation *type*,
@@ -1859,26 +1861,64 @@ class PostgreSQLOps(DataAccessOps):
         operator who reserves the whole of ``WORKER_MAX_SLOTS`` by type leaves no
         shared pool for it to rotate in — deliberate, and the reason the defaults
         keep a shared pool.
-        """
-        return await conn.fetch(
-            f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
-            FROM {table} o
-            WHERE o.status = 'pending'
-              AND o.task_payload IS NOT NULL
-              AND o.operation_type = $1
-              AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
-              AND {bank_serialization_sql(table, "o")}
-              AND {key_serialization_sql(table, "o")}
-            ORDER BY o.created_at
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
-            """,
-            op_type,
-            limit,
-        )
 
-    async def _claim_shared_tasks(self, conn, table, claimed_ids, limit, bank_cursor) -> list:
+        ``live_window_hours`` and ``backfill_excluded_banks`` mean what they do in
+        ``_claim_shared_tasks``: rows queued within the window are claimed first (a
+        second bounded range scan rather than a sort), and an excluded bank's retains
+        queued before the window are skipped.
+        """
+
+        async def _fetch(lim: int, extra: str, args: list) -> list:
+            return await conn.fetch(
+                f"""
+                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
+                FROM {table} o
+                WHERE o.status = 'pending'
+                  AND o.task_payload IS NOT NULL
+                  AND o.operation_type = $1
+                  AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
+                  AND {bank_serialization_sql(table, "o")}
+                  AND {key_serialization_sql(table, "o")}{extra}
+                ORDER BY o.created_at
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+                """,
+                op_type,
+                lim,
+                *args,
+            )
+
+        if live_window_hours <= 0 and not backfill_excluded_banks:
+            return await _fetch(limit, "", [])
+        args: list = []
+        old = ""
+        if live_window_hours > 0:
+            args.append(int(live_window_hours))
+            old = " AND o.created_at <= NOW() - make_interval(hours => $3)"
+        skip = ""
+        if backfill_excluded_banks:
+            args.append(list(backfill_excluded_banks))
+            skip = f" AND NOT (o.operation_type = 'retain' AND o.bank_id = ANY(${len(args) + 2}::text[]){old})"
+        rows: list = []
+        if live_window_hours > 0:
+            rows = await _fetch(limit, " AND o.created_at > NOW() - make_interval(hours => $3)" + skip, args)
+        if len(rows) < limit:
+            taken = [r["operation_id"] for r in rows]
+            rest_args = [*args, taken]
+            rest = f"{old}{skip} AND o.operation_id != ALL(${len(rest_args) + 2}::uuid[])"
+            rows = [*rows, *await _fetch(limit - len(rows), rest, rest_args)]
+        return rows
+
+    async def _claim_shared_tasks(
+        self,
+        conn,
+        table,
+        claimed_ids,
+        limit,
+        bank_cursor,
+        live_window_hours: int = 0,
+        backfill_excluded_banks=(),
+    ) -> list:
         """Claim the shared pool: one row for the bank whose turn it is, rest by age.
 
         Deficit round robin (Shreedhar & Varghese) with a quantum of one slot.
@@ -1924,6 +1964,14 @@ class PostgreSQLOps(DataAccessOps):
         rather than that bank's oldest — sorting by ``created_at`` there would
         need an index on ``(bank_id, created_at)`` and cost 12 s without one, and
         per-key order is held by ``key_serialization_sql`` regardless.
+
+        With ``live_window_hours`` > 0 a ``live`` tier sits between the two: rows
+        queued within the window, oldest first, ahead of the backlog behind them.
+        It is the same ``created_at`` range scan as ``fifo``, bounded by the
+        window, so live work no longer waits behind a backfill that is already
+        due. ``backfill_excluded_banks`` drops those banks' retains queued before
+        the window from every tier (their hourly backfill budget is spent; the
+        poller works the list out, so the claim adds only an array test).
         """
         params: list = [bank_cursor]
         exclusion = ""
@@ -1934,6 +1982,18 @@ class PostgreSQLOps(DataAccessOps):
             params.append(claimed_ids)
             idx += 1
 
+        window = ""
+        if live_window_hours > 0:
+            window = f"NOW() - make_interval(hours => ${idx})"
+            params.append(int(live_window_hours))
+            idx += 1
+
+        if backfill_excluded_banks:
+            older = f" AND o.created_at <= {window}" if window else ""
+            exclusion += f" AND NOT (o.operation_type = 'retain' AND o.bank_id = ANY(${idx}::text[]){older})"
+            params.append(list(backfill_excluded_banks))
+            idx += 1
+
         params.append(limit)
         claimable = f"""o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1941,6 +2001,24 @@ class PostgreSQLOps(DataAccessOps):
               AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
               AND {bank_serialization_sql(table, "o")}
               AND {key_serialization_sql(table, "o")}{exclusion}"""
+
+        live = ""
+        live_union = ""
+        not_live = ""
+        if window:
+            live = f""", live AS (
+                SELECT o.operation_id, 1 AS tier, o.created_at
+                FROM {table} o
+                WHERE {claimable}
+                  AND o.created_at > {window}
+                  AND NOT EXISTS (SELECT 1 FROM rot WHERE rot.operation_id = o.operation_id)
+                ORDER BY o.created_at
+                LIMIT ${idx}
+            )"""
+            live_union = " UNION ALL SELECT * FROM live"
+            not_live = (
+                "\n                  AND NOT EXISTS (SELECT 1 FROM live WHERE live.operation_id = o.operation_id)"
+            )
 
         return await conn.fetch(
             f"""
@@ -1951,15 +2029,15 @@ class PostgreSQLOps(DataAccessOps):
                   AND o.bank_id > $1
                 ORDER BY o.bank_id
                 LIMIT 1
-            ), fifo AS (
-                SELECT o.operation_id, 1 AS tier, o.created_at
+            ){live}, fifo AS (
+                SELECT o.operation_id, 2 AS tier, o.created_at
                 FROM {table} o
                 WHERE {claimable}
-                  AND NOT EXISTS (SELECT 1 FROM rot WHERE rot.operation_id = o.operation_id)
+                  AND NOT EXISTS (SELECT 1 FROM rot WHERE rot.operation_id = o.operation_id){not_live}
                 ORDER BY o.created_at
                 LIMIT ${idx}
             ), cand AS (
-                SELECT * FROM rot UNION ALL SELECT * FROM fifo
+                SELECT * FROM rot{live_union} UNION ALL SELECT * FROM fifo
             )
             SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count,
                    o.serialization_key, o.bank_id, o.created_at, c.tier
@@ -1973,6 +2051,23 @@ class PostgreSQLOps(DataAccessOps):
             *params,
         )
 
+    async def backfill_budget_spent_banks(self, conn, table, budget_chars, live_window_hours):
+        older = " AND created_at <= claimed_at - make_interval(hours => $2)" if live_window_hours > 0 else ""
+        args: list = [int(budget_chars)] + ([int(live_window_hours)] if live_window_hours > 0 else [])
+        rows = await conn.fetch(
+            f"""
+            SELECT bank_id
+            FROM {table}
+            WHERE operation_type = 'retain'
+              AND claimed_at > NOW() - INTERVAL '1 hour'
+              AND task_payload IS NOT NULL{older}
+            GROUP BY bank_id
+            HAVING SUM(length((task_payload->'contents')::text)) >= $1
+            """,
+            *args,
+        )
+        return [r["bank_id"] for r in rows]
+
     async def claim_tasks(
         self,
         conn,
@@ -1983,6 +2078,8 @@ class PostgreSQLOps(DataAccessOps):
         *,
         bank_cursor="",
         consolidation_bank_priority=None,
+        live_window_hours=0,
+        backfill_excluded_banks=(),
     ):
         all_rows = []
         claimed_ids = []
@@ -2011,7 +2108,16 @@ class PostgreSQLOps(DataAccessOps):
                     )
                 )
             else:
-                _collect(await self._claim_reserved_tasks(conn, table, limit, op_type))
+                _collect(
+                    await self._claim_reserved_tasks(
+                        conn,
+                        table,
+                        limit,
+                        op_type,
+                        live_window_hours=live_window_hours,
+                        backfill_excluded_banks=backfill_excluded_banks,
+                    )
+                )
 
         # --- Phase 2: claim from shared pool ---
         remaining_shared = shared_limit
@@ -2021,7 +2127,15 @@ class PostgreSQLOps(DataAccessOps):
             # graph_maintenance stays in this created_at-ordered query — see
             # bank_serialization_sql for why it is a predicate rather than a
             # phase of its own.
-            shared_rows = await self._claim_shared_tasks(conn, table, claimed_ids, remaining_shared, bank_cursor)
+            shared_rows = await self._claim_shared_tasks(
+                conn,
+                table,
+                claimed_ids,
+                remaining_shared,
+                bank_cursor,
+                live_window_hours=live_window_hours,
+                backfill_excluded_banks=backfill_excluded_banks,
+            )
             # An empty rotation tier means no bank sorts after the cursor: the
             # round is over, so the next claim starts from the beginning.
             next_bank_cursor = next((row["bank_id"] for row in shared_rows if row["tier"] == 0), "")

@@ -1149,6 +1149,8 @@ ENV_WORKER_MAX_RETRIES = "HINDSIGHT_API_WORKER_MAX_RETRIES"
 ENV_WORKER_TASK_RETRY_BACKOFF_SECONDS = "HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS"
 ENV_WORKER_HTTP_PORT = "HINDSIGHT_API_WORKER_HTTP_PORT"
 ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
+ENV_WORKER_LIVE_WINDOW_HOURS = "HINDSIGHT_API_WORKER_LIVE_WINDOW_HOURS"
+ENV_WORKER_BACKFILL_CHARS_PER_BANK_HOUR = "HINDSIGHT_API_WORKER_BACKFILL_CHARS_PER_BANK_HOUR"
 ENV_WORKER_SHUTDOWN_DRAIN_SECONDS = "HINDSIGHT_API_WORKER_SHUTDOWN_DRAIN_SECONDS"
 # How long a task shed for store backpressure is held before it is retried.
 ENV_BACKPRESSURE_DEFER_SECONDS = "HINDSIGHT_API_BACKPRESSURE_DEFER_SECONDS"
@@ -2332,6 +2334,12 @@ DEFAULT_WORKER_MAX_RETRIES = 3  # Max retries before marking task failed
 DEFAULT_WORKER_TASK_RETRY_BACKOFF_SECONDS = 60  # Seconds between retries on transient task failure
 DEFAULT_WORKER_HTTP_PORT = 8889  # HTTP port for worker metrics/health
 DEFAULT_WORKER_MAX_SLOTS = 10  # Total concurrent tasks per worker
+# Claim operations queued within this many hours ahead of older ones (live work before backfill).
+# 0 keeps plain oldest-first claiming.
+DEFAULT_WORKER_LIVE_WINDOW_HOURS = 0
+# Per bank, stop claiming retains queued before the live window once this many payload characters
+# of them were claimed in the past hour; they wait for the next hour. 0 = no budget.
+DEFAULT_WORKER_BACKFILL_CHARS_PER_BANK_HOUR = 0
 # How long shutdown waits for in-flight tasks before cancelling them and handing their
 # rows back to 'pending'. Counted from SIGTERM. Drain + ~5s cancel + ~2s release must fit
 # the platform's grace period; 20s fits Kubernetes' default 30s (#6021).
@@ -4209,6 +4217,8 @@ class HindsightConfig:
     worker_task_retry_backoff_seconds: int
     worker_http_port: int
     worker_max_slots: int
+    worker_live_window_hours: int
+    worker_backfill_chars_per_bank_hour: int
     worker_shutdown_drain_seconds: float
     worker_slot_reservations: dict[str, int]
     worker_consolidation_bank_priority: dict[str, int]
@@ -6177,6 +6187,15 @@ class HindsightConfig:
             ),
             worker_http_port=int(os.getenv(ENV_WORKER_HTTP_PORT, str(DEFAULT_WORKER_HTTP_PORT))),
             worker_max_slots=int(os.getenv(ENV_WORKER_MAX_SLOTS, str(DEFAULT_WORKER_MAX_SLOTS))),
+            worker_live_window_hours=max(
+                0, int(os.getenv(ENV_WORKER_LIVE_WINDOW_HOURS, str(DEFAULT_WORKER_LIVE_WINDOW_HOURS)))
+            ),
+            worker_backfill_chars_per_bank_hour=max(
+                0,
+                int(
+                    os.getenv(ENV_WORKER_BACKFILL_CHARS_PER_BANK_HOUR, str(DEFAULT_WORKER_BACKFILL_CHARS_PER_BANK_HOUR))
+                ),
+            ),
             worker_shutdown_drain_seconds=float(
                 os.getenv(ENV_WORKER_SHUTDOWN_DRAIN_SECONDS, str(DEFAULT_WORKER_SHUTDOWN_DRAIN_SECONDS))
             ),
